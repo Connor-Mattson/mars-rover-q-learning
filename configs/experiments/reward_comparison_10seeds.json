@@ -1,0 +1,17 @@
+{
+  "name": "reward_comparison_10seeds",
+  "scenarios": ["safe_corridor", "risk_value_tradeoff", "shaping_trap"],
+  "reward_modes": ["sparse", "naive_dense", "potential"],
+  "seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "episodes": 4000,
+  "eval_episodes": 300,
+  "learning_rate": 0.2,
+  "gamma": 0.99,
+  "initial_q": 0.0,
+  "epsilon_start": 1.0,
+  "epsilon_end": 0.05,
+  "epsilon_decay_fraction": 0.6,
+  "success_threshold": 0.8,
+  "threshold_window": 100,
+  "log_every": 0
+}

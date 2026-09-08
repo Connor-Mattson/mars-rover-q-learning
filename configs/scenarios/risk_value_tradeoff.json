@@ -1,0 +1,30 @@
+{
+  "name": "risk_value_tradeoff",
+  "description": "A sand basin ringed by rough terrain: the biosignature is worth four times the basalt core but the crossing is slow and slippery.",
+  "grid": [
+    "############",
+    "#....##....#",
+    "#.##......##",
+    "#.#~~~~~~..#",
+    "#.#~ssss~..#",
+    "#..~ssss~..#",
+    "#..~ssss~..#",
+    "#.#~~~~~~..#",
+    "#.##......##",
+    "#....##....#",
+    "#..........#",
+    "############"
+  ],
+  "lander": [10, 1],
+  "samples": {
+    "basalt": { "position": [10, 3], "value": 40 },
+    "hydrated_mineral": { "position": [1, 10], "value": 90 },
+    "biosignature": { "position": [5, 5], "value": 160 }
+  },
+  "battery_capacity": 70,
+  "max_steps": 180,
+  "collect_energy_cost": 1,
+  "battery_penalty": -100.0,
+  "step_limit_penalty": -100.0,
+  "shaping": { "closer_bonus": 2.0, "farther_penalty": -1.0 }
+}

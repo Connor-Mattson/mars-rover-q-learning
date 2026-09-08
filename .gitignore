@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+# Generated experiment output. A small curated example result set may be
+# force-added later, after the human-owned functions exist and a real run is done.
+artifacts/*
+!artifacts/.gitkeep

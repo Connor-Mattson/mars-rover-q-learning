@@ -1,0 +1,16 @@
+{
+  "name": "smoke",
+  "scenarios": ["safe_corridor"],
+  "reward_modes": ["sparse", "naive_dense", "potential"],
+  "seeds": [1, 2],
+  "episodes": 40,
+  "eval_episodes": 10,
+  "learning_rate": 0.3,
+  "gamma": 0.99,
+  "epsilon_start": 1.0,
+  "epsilon_end": 0.1,
+  "epsilon_decay_fraction": 0.6,
+  "success_threshold": 0.8,
+  "threshold_window": 20,
+  "log_every": 0
+}

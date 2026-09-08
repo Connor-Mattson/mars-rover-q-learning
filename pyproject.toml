@@ -1,0 +1,78 @@
+[project]
+name = "mars-rover-q"
+version = "0.1.0"
+description = "Mars Sample Return: Reward Design in Tabular Q-Learning"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Connor" }]
+dependencies = [
+    "numpy>=2.1,<3.0",
+    "pygame>=2.6,<3.0",
+    "matplotlib>=3.9,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9.0",
+    "pytest-cov>=5.0,<7.0",
+    "ruff>=0.6,<1.0",
+    "mypy>=1.11,<2.0",
+]
+
+[project.scripts]
+mars-rover-q = "mars_rover_q.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mars_rover_q"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The default run is the green suite: the intentionally failing teaching tests are
+# deselected here and must be run explicitly (see .teacher/how-to-test.md).
+addopts = "-m 'not human_todo' --strict-markers"
+markers = [
+    "human_todo: contract tests for the five human-owned functions; expected to FAIL until they are implemented",
+    "slow: longer-running integration tests",
+]
+filterwarnings = ["error::DeprecationWarning:mars_rover_q.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF", "N", "ARG", "PTH"]
+ignore = ["RUF012"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ARG001", "ARG002"]
+# The teaching stubs deliberately ignore most of their arguments; the real
+# implementations will use them, but the signatures are the published contract.
+"src/mars_rover_q/agent.py" = ["ARG001"]
+# Reward models implement a fixed RewardModel signature; not every condition needs
+# every part of the transition. B027: `reset` is an optional hook, not abstract.
+"src/mars_rover_q/rewards.py" = ["ARG002", "B027"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src", "tests"]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["pygame.*", "matplotlib.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src/mars_rover_q"]

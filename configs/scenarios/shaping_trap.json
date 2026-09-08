@@ -1,0 +1,30 @@
+{
+  "name": "shaping_trap",
+  "description": "A wide flat plaza north of a rough/rock barrier. Every adjacent pair in the plaza is a two-cell cycle the naive asymmetric bonus pays for, and the battery is large enough to farm it for longer than the mission is worth.",
+  "grid": [
+    "############",
+    "#..........#",
+    "#..........#",
+    "#..........#",
+    "#..........#",
+    "####~~~~####",
+    "#..s......s#",
+    "#.^^^^^^^^.#",
+    "#..........#",
+    "#.###..###.#",
+    "#.#......#.#",
+    "############"
+  ],
+  "lander": [2, 5],
+  "samples": {
+    "basalt": { "position": [6, 10], "value": 40 },
+    "hydrated_mineral": { "position": [8, 2], "value": 90 },
+    "biosignature": { "position": [10, 7], "value": 160 }
+  },
+  "battery_capacity": 180,
+  "max_steps": 250,
+  "collect_energy_cost": 1,
+  "battery_penalty": -100.0,
+  "step_limit_penalty": -100.0,
+  "shaping": { "closer_bonus": 6.0, "farther_penalty": -2.0 }
+}

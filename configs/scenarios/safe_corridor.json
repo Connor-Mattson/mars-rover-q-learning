@@ -1,0 +1,28 @@
+{
+  "name": "safe_corridor",
+  "description": "Walled corridors on flat ground: teaches collect-and-return with visibly different route lengths and sample values.",
+  "grid": [
+    "##########",
+    "#......~.#",
+    "#.##.###.#",
+    "#.#....#.#",
+    "#.#.##.#.#",
+    "#....#.#.#",
+    "#.##.#.#.#",
+    "#.#..#.#.#",
+    "#....#.~.#",
+    "##########"
+  ],
+  "lander": [5, 1],
+  "samples": {
+    "basalt": { "position": [3, 3], "value": 40 },
+    "hydrated_mineral": { "position": [7, 3], "value": 90 },
+    "biosignature": { "position": [7, 8], "value": 160 }
+  },
+  "battery_capacity": 60,
+  "max_steps": 150,
+  "collect_energy_cost": 1,
+  "battery_penalty": -100.0,
+  "step_limit_penalty": -100.0,
+  "shaping": { "closer_bonus": 2.0, "farther_penalty": -1.0 }
+}
