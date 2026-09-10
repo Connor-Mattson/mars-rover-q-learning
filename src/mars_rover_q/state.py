@@ -9,7 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Final
+from typing import Any, Final
+
+from numpy.typing import NDArray
 
 
 class SampleType(IntEnum):
@@ -122,6 +124,28 @@ class StateEncoder:
         cell, battery = divmod(index, self.battery_levels)
         row, col = divmod(cell, self.cols)
         return RoverState(row=row, col=col, battery=battery, carried=SampleType(carried))
+
+    def grid_view(self, values: NDArray[Any]) -> NDArray[Any]:
+        """View a per-state vector as ``(rows, cols, battery_levels, payloads)``.
+
+        The encoding is mixed-radix in exactly this order, so the reshape *is* the
+        decode for whole-table quantities -- a visit-count vector, a coverage mask.
+        Anything that wants to marginalise battery away, which every map figure
+        does, sums axis 2 of this view instead of decoding every index one at a
+        time.
+
+        Returns a view into ``values`` when the array is contiguous, so callers
+        must not write through it expecting the original to stay untouched.
+
+        Raises:
+            ValueError: if ``values`` is not a 1-D array of length
+                :attr:`num_states`.
+        """
+        if values.ndim != 1 or values.shape[0] != self.num_states:
+            raise ValueError(
+                f"expected a 1-D array of {self.num_states} state values, got shape {values.shape}"
+            )
+        return values.reshape(self.rows, self.cols, self.battery_levels, NUM_PAYLOAD_STATES)
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (

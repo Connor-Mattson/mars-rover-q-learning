@@ -1,13 +1,12 @@
 """Tabular Q-learning agent.
 
-Five functions in this module are **owned by Connor** and are deliberately left
-incomplete. They carry ``TODO(human):`` markers and compile-safe placeholder
-behaviour so that manual play, rendering, the CLI, and the experiment plumbing all
-work before the learning algorithm exists.
+The five functions below -- table allocation, the one-step target, the TD error,
+the in-place update, and epsilon-greedy action selection -- are the whole learning
+algorithm. They were implemented by Connor; everything else in the package is
+plumbing around them.
 
-Do not implement these algorithms anywhere else -- not in the trainer, not in
-tests, not in helper modules. The real training path calls exactly these
-functions.
+These algorithms live here and nowhere else -- not in the trainer, not in tests,
+not in helper modules. The real training path calls exactly these functions.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ QTable = NDArray[np.float64]
 
 
 # ---------------------------------------------------------------------------
-# Human-owned functions
+# The learning algorithm
 # ---------------------------------------------------------------------------
 
 
@@ -55,11 +54,18 @@ def initialize_q_table(
     Invariants:
         The returned array is independent of any previously returned array.
     """
-    # TODO(human): allocate the table with the requested shape, dtype and initial
-    # value, and reject non-positive dimensions.
-    # Placeholder: correct shape, but the requested initial value is ignored and
-    # invalid dimensions are silently clamped instead of rejected.
-    return np.zeros((max(int(num_states), 0), max(int(num_actions), 0)), dtype=dtype)
+    if num_states < 1:
+        raise ValueError(
+            "You must have at least 1 state in the MDP! "
+            "Please call initialize_q_table with param num_states >= 1"
+        )
+    if num_actions < 1:
+        raise ValueError(
+            "You must have at least 1 action in the MDP! "
+            "Please call initialize_q_table with param num_actions >= 1"
+        )
+    table = np.full((num_states, num_actions), initial_value, dtype=dtype)
+    return table
 
 
 def calculate_target(
@@ -92,10 +98,9 @@ def calculate_target(
         the README; it makes truncated episodes slightly pessimistic, which is the
         trade accepted here for a simpler, honest learning rule.
     """
-    # TODO(human): build the one-step target, bootstrapping only when the
-    # transition did not end the episode.
-    # Placeholder: reward only, so nothing ever propagates backwards.
-    return float(reward)
+    if terminated or truncated:
+        return float(reward)
+    return float(reward + (gamma * (max(next_state_values))))
 
 
 def calculate_td_error(current_estimate: float, target: float) -> float:
@@ -112,9 +117,7 @@ def calculate_td_error(current_estimate: float, target: float) -> float:
         move up. Sign matters: it is what makes the update a correction rather than
         a drift.
     """
-    # TODO(human): return the signed discrepancy between estimate and target.
-    # Placeholder: always zero, so every update is a no-op.
-    return 0.0
+    return target - current_estimate
 
 
 def update_q_value(
@@ -139,8 +142,8 @@ def update_q_value(
         Exactly one entry changes. Every other entry of ``q_table`` -- including
         other actions of the same state -- must be bit-for-bit unchanged.
     """
-    # TODO(human): move the selected entry along the TD error by the learning rate.
-    # Placeholder: no-op, so the table never changes.
+    q_prev = q_table[state_index][action_index]
+    q_table[state_index][action_index] = q_prev + (learning_rate * (td_error))
     return None
 
 
@@ -178,15 +181,26 @@ def select_action(
     Raises:
         ValueError: if ``action_mask`` marks no action as legal.
     """
-    # TODO(human): implement epsilon-greedy selection with random tie-breaking,
-    # drawing every random number from `rng`.
-    # Placeholder: always the first legal action, so the rover never explores.
-    if action_mask is None:
-        return 0
-    legal = np.flatnonzero(action_mask)
-    if legal.size == 0:
-        raise ValueError("action_mask marks no action as legal")
-    return int(legal[0])
+    legal = (
+        np.flatnonzero(action_mask).tolist()
+        if action_mask is not None
+        else list(range(q_table.shape[1]))
+    )
+    if len(legal) == 0:
+        raise ValueError(
+            "There are no valid actions for the action mask. "
+            "Check that action_mask passed to select_action has len > 0!"
+        )
+
+    # Obtain Max Q Value
+    q_vals = q_table[state_index]
+    legal_actions = [(float(q_vals[i]), i) for i in legal]
+    max_q = max(legal_actions)[0]
+    max_a_candidates = [g[1] for g in legal_actions if g[0] == max_q]
+
+    if rng.random() < epsilon:
+        return int(rng.choice(legal))
+    return int(rng.choice(max_a_candidates))
 
 
 # ---------------------------------------------------------------------------

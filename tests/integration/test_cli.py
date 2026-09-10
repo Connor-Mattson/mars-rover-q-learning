@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mars_rover_q.cli import build_parser, main
+from mars_rover_q.scenario import resolve_scenario
 
 
 @pytest.mark.parametrize(
@@ -18,6 +19,7 @@ from mars_rover_q.cli import build_parser, main
         ["evaluate", "--run", "some/run", "--episodes", "500"],
         ["experiment", "--config", "configs/experiments/reward_comparison.json"],
         ["replay", "--run", "some/run", "--episode", "best"],
+        ["curriculum", "--scenario", "safe_corridor", "--curriculum-fraction", "0.5"],
     ],
 )
 def test_parser_accepts_every_documented_workflow(argv: list[str]) -> None:
@@ -56,6 +58,7 @@ def test_train_writes_a_run_directory(tmp_path: Path, capsys: pytest.CaptureFixt
             "--output",
             str(run_dir),
             "--quiet",
+            "--no-figs",
         ]
     )
     assert code == 0
@@ -80,6 +83,7 @@ def test_evaluate_reads_back_a_saved_run(
             "--output",
             str(run_dir),
             "--quiet",
+            "--no-figs",
         ]
     )
     capsys.readouterr()
@@ -107,6 +111,7 @@ def test_train_accepts_every_reward_mode(tmp_path: Path) -> None:
                     "--output",
                     str(run_dir),
                     "--quiet",
+                    "--no-figs",
                 ]
             )
             == 0
@@ -120,7 +125,6 @@ def test_unknown_reward_mode_is_rejected() -> None:
         build_parser().parse_args(["train", "--reward", "dense_but_clever"])
 
 
-@pytest.mark.slow
 def test_experiment_command_runs_a_tiny_grid(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -159,7 +163,159 @@ def test_replay_requires_a_stored_episode(tmp_path: Path) -> None:
             "--output",
             str(run_dir),
             "--quiet",
+            "--no-figs",
         ]
     )
     with pytest.raises(SystemExit, match="no stored best episode"):
         main(["replay", "--run", str(run_dir)])
+
+
+def test_curriculum_command_reports_the_pool(capsys: pytest.CaptureFixture[str]) -> None:
+    """Inspecting the curriculum must work whether or not the pool is populated."""
+    assert main(["curriculum", "--scenario", "safe_corridor", "--episodes", "200"]) == 0
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out.split("\n\n")[0])
+    assert payload["requested"] is True
+    assert payload["anneal_fraction"] == 0.5
+    assert payload["canonical_difficulty"] > 0
+    if payload["pool_size"]:
+        # Every strategy is dry-run side by side, which is the comparison the
+        # command exists for.
+        assert "simulated starts by anneal progress" in captured.out
+        for strategy in ("growing", "sliding", "visit_weighted"):
+            assert strategy in captured.out
+    else:
+        assert "no admissible start states" in captured.err
+
+
+def test_curriculum_command_dry_runs_one_strategy_on_request(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert (
+        main(
+            [
+                "curriculum",
+                "--scenario",
+                "safe_corridor",
+                "--episodes",
+                "200",
+                "--strategy",
+                "sliding",
+                "--window-fraction",
+                "0.1",
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "window_fraction=0.1" in output
+    assert "visit_weighted" not in output
+
+
+def test_train_reports_state_coverage(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    code = main(
+        [
+            "train",
+            "--scenario",
+            "safe_corridor",
+            "--episodes",
+            "2",
+            "--eval-episodes",
+            "0",
+            "--curriculum-fraction",
+            "0.5",
+            "--output",
+            str(tmp_path / "run"),
+            "--quiet",
+            "--no-figs",
+        ]
+    )
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "tied (never-decided) states:" in output
+    assert "curriculum: strategy=growing pool=" in output
+
+    manifest = json.loads((tmp_path / "run" / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["config"]["curriculum_fraction"] == 0.5
+    assert manifest["curriculum"]["requested"] is True
+    assert 0.0 <= manifest["tied_state_fraction"] <= 1.0
+
+
+def _train_args(run_dir: Path, *extra: str) -> list[str]:
+    return [
+        "train",
+        "--scenario",
+        "safe_corridor",
+        "--episodes",
+        "2",
+        "--eval-episodes",
+        "0",
+        "--output",
+        str(run_dir),
+        "--quiet",
+        *extra,
+    ]
+
+
+def test_train_writes_the_per_run_figures(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-battery-figs")) == 0
+
+    figs = sorted(path.name for path in (run_dir / "figs").iterdir())
+    assert figs == ["experience_heatmaps.png", "state_coverage.png"]
+    assert "figure written to" in capsys.readouterr().out
+
+
+@pytest.mark.slow
+def test_train_writes_a_battery_frame_per_battery_level(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir)) == 0
+
+    frames = sorted((run_dir / "figs" / "q_by_battery").iterdir())
+    scenario = resolve_scenario("safe_corridor")
+    assert len(frames) == scenario.battery_capacity + 1
+    # Counted, not listed: sixty-one paths differing in two characters would bury
+    # the run summary they are printed beside.
+    output = capsys.readouterr().out
+    assert f"{len(frames)} battery frames written to" in output
+    assert frames[0].name not in output
+
+
+def test_train_can_skip_only_the_battery_frames(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-battery-figs")) == 0
+
+    assert (run_dir / "figs" / "state_coverage.png").exists()
+    assert not (run_dir / "figs" / "q_by_battery").exists()
+
+
+def test_train_can_skip_the_figures(tmp_path: Path) -> None:
+    """The sweep's per-cell cost is the reason this switch exists."""
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs")) == 0
+
+    assert not (run_dir / "figs").exists()
+
+
+def test_figures_subcommand_redraws_a_saved_run(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs")) == 0
+    assert main(["figures", "--run", str(run_dir), "--no-battery-figs"]) == 0
+
+    assert (run_dir / "figs" / "state_coverage.png").exists()
+
+
+def test_figures_subcommand_warns_when_visit_counts_are_missing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs")) == 0
+    (run_dir / "visit_counts.npy").unlink()
+    capsys.readouterr()
+
+    assert main(["figures", "--run", str(run_dir), "--no-battery-figs"]) == 0
+    assert "no visit_counts.npy" in capsys.readouterr().err

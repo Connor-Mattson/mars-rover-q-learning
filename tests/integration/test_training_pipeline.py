@@ -8,6 +8,7 @@ learning works, which is not yet true.
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import pytest
 from mars_rover_q import agent, evaluation, training
 from mars_rover_q.evaluation import evaluate
 from mars_rover_q.experiment import load_run, read_training_csv, save_run, write_training_csv
+from mars_rover_q.metrics import canonical_start_records, learned_state_mask
 from mars_rover_q.rewards import RewardMode
 from mars_rover_q.scenario import Scenario, resolve_scenario
 from mars_rover_q.training import TrainConfig, split_rngs, train
@@ -202,3 +204,134 @@ def test_manifest_records_the_teaching_state_and_provenance(
 def test_load_run_reports_a_missing_manifest(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="manifest"):
         load_run(tmp_path)
+
+
+def test_a_third_stream_leaves_the_first_two_untouched() -> None:
+    """Adding the curriculum stream must not move any existing baseline.
+
+    ``SeedSequence.spawn`` is prefix-stable, so asking for three generators returns
+    the same first two as asking for two. If that ever stopped holding, every run
+    recorded before the curriculum existed would silently stop reproducing.
+    """
+    env_two, agent_two = split_rngs(11)
+    env_three, agent_three, curriculum_three = split_rngs(11, 3)
+
+    assert env_two.random(8).tolist() == env_three.random(8).tolist()
+    assert agent_two.random(8).tolist() == agent_three.random(8).tolist()
+    assert curriculum_three.random(8).tolist() != env_three.random(8).tolist()
+
+
+def test_training_starts_every_episode_at_the_lander_by_default(
+    corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    assert quick_config.curriculum_fraction == 0.0
+    assert all(r.from_canonical_start for r in result.records)
+    assert len(canonical_start_records(result.records)) == len(result.records)
+    assert result.metadata["curriculum"]["requested"] is False
+    assert result.metadata["curriculum"]["distinct_start_states"] == 1
+    assert not result.curriculum_was_active
+
+
+def test_training_reports_state_coverage(corridor: Scenario, quick_config: TrainConfig) -> None:
+    """The diagnostic the curriculum exists to move."""
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    fraction = result.metadata["tied_state_fraction"]
+    assert 0.0 <= fraction <= 1.0
+    # A handful of short episodes cannot possibly have decided a corridor-sized table.
+    assert fraction > 0.5
+
+
+def test_a_requested_curriculum_with_an_empty_pool_says_so_loudly(
+    corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    """A run that silently fell back to the lander must not be reported as curricular."""
+    from dataclasses import replace
+
+    config = replace(quick_config, curriculum_fraction=0.5)
+    stream = io.StringIO()
+    result = train(corridor, config, warn_on_stubs=True, stream=stream)
+    curriculum = result.metadata["curriculum"]
+
+    assert curriculum["requested"] is True
+    if not curriculum["active"]:
+        assert "CURRICULUM NOT ACTIVE" in stream.getvalue()
+        assert all(r.from_canonical_start for r in result.records)
+        assert not result.curriculum_was_active
+    else:
+        assert "CURRICULUM NOT ACTIVE" not in stream.getvalue()
+        assert curriculum["pool_size"] > 0
+
+
+def test_metrics_round_trip_through_csv_with_curriculum_episodes(
+    tmp_path: Path, corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    """``csv`` has no types: the start flag must come back as a bool, not ``int("True")``."""
+    from dataclasses import replace
+
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    records = [
+        replace(record, from_canonical_start=index % 2 == 0)
+        for index, record in enumerate(result.records)
+    ]
+    path = tmp_path / "metrics.csv"
+    write_training_csv(path, records)
+    restored = read_training_csv(path)
+
+    assert restored == records
+    assert [r.from_canonical_start for r in restored] == [r.from_canonical_start for r in records]
+    assert len(canonical_start_records(restored)) == len(canonical_start_records(records))
+
+
+def test_visit_counts_account_for_every_environment_step(
+    corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    """One Q-update per step, so the counter has to close against ``total_env_steps``."""
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+
+    assert result.visit_counts.shape == (result.metadata["num_states"],)
+    assert int(result.visit_counts.sum()) == result.total_env_steps
+    assert int(np.count_nonzero(result.visit_counts)) == result.metadata["visited_state_count"]
+
+
+def test_learned_states_are_a_subset_of_visited_states(
+    corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    """Nothing is learned without a visit -- but a visit need not learn anything.
+
+    Under a sparse reward most updates carry a zero TD error, so a visited state
+    can finish still holding its initial value everywhere. The containment runs
+    one way only, and the two figures have to be read accordingly: "reached" on
+    the map is a superset of "learned" on the coverage bars, never the same set.
+    """
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    learned = learned_state_mask(result.q_table, quick_config.initial_q)
+    visited = result.visit_counts > 0
+
+    assert np.all(visited[learned])
+    assert int(learned.sum()) < int(visited.sum())
+
+
+def test_visit_counts_round_trip_through_a_run_directory(
+    tmp_path: Path, corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    save_run(tmp_path / "run", corridor, result, None)
+    loaded = load_run(tmp_path / "run")
+
+    assert loaded.visit_counts is not None
+    assert np.array_equal(loaded.visit_counts, result.visit_counts)
+    assert loaded.manifest["visited_state_count"] == result.metadata["visited_state_count"]
+
+
+def test_a_run_saved_without_its_table_reports_no_visit_counts(
+    tmp_path: Path, corridor: Scenario, quick_config: TrainConfig
+) -> None:
+    """``None`` means "not recorded", which is not the same as "no experience"."""
+    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
+    save_run(tmp_path / "run", corridor, result, None, save_q_table=False)
+
+    manifest_path = tmp_path / "run" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["artifacts"]["visit_counts"] is None
+    assert not (tmp_path / "run" / "visit_counts.npy").exists()

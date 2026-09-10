@@ -131,4 +131,7 @@ def test_replay_steps_through_a_recorded_trajectory(
         ),
     )
     policy = greedy_actions(np.zeros((10, 5)))
-    replay_trajectory(corridor, trajectory, policy=policy, fps=1.0)
+    # 240 rather than 1: the throttle in `replay_trajectory` clamps at `max(1.0, speed)`,
+    # so a 1 fps replay really does sleep a second a frame. Nothing here asserts on
+    # timing -- the keys are what is under test -- and the throttle path still runs.
+    replay_trajectory(corridor, trajectory, policy=policy, fps=240.0)

@@ -1,115 +1,83 @@
-# How to test
+# How to Test
 
-All commands run from the repository root with the virtual environment active.
+No assignment is open. These are the standing gates.
+
+## Everything
 
 ```bash
-source .venv/bin/activate     # or: uv run <command>
+ruff format --check . && ruff check . && mypy && pytest
 ```
 
----
+Expected: `56 files already formatted`, `All checks passed!`,
+`Success: no issues found in 46 source files`, `370 passed, 115 deselected`.
 
-## The two commands that matter
+## The teaching suite
+
+Deselected from the default run by `addopts`, so it must be asked for by name:
 
 ```bash
-# 1. The quality gate. Must be green, before and after your work.
-pytest
-
-# 2. Your assignment. EXPECTED TO FAIL until agent.py is implemented.
 pytest -m human_todo tests/human_todo
 ```
 
-`pytest` deselects the `human_todo` marker by default (`addopts` in `pyproject.toml`),
-so the two suites never mix. Nothing in the first command should ever fail; everything
-in the second should, until you are done.
+Expected: `115 passed`. It should stay green from here — a failure now is a
+regression in a finished function, not an open assignment.
 
-## Focused loops while you work
+## The fast feedback loop
 
-One function at a time, in the order the assignment lists them:
-
-```bash
-pytest -m human_todo tests/human_todo -k q_table      # 1. initialize_q_table
-pytest -m human_todo tests/human_todo -k target       # 2. calculate_target
-pytest -m human_todo tests/human_todo -k td_error     # 3. calculate_td_error
-pytest -m human_todo tests/human_todo -k update       # 4. update_q_value
-pytest -m human_todo tests/human_todo -k "epsilon or tie or mask or selection"  # 5.
-```
-
-Useful flags: `-x` stops at the first failure, `-q` trims the output, `--tb=line` prints
-one line per failure, and `-k <substring>` narrows to matching test names.
-
-## Expected state **before** you implement anything
-
-```
-$ pytest
-178 passed, 34 deselected
-
-$ pytest -m human_todo tests/human_todo
-25 failed, 9 passed
-```
-
-The nine that pass are the parts the placeholders happen to satisfy — correct table
-shape, correct dtype, a zero initial value, and the two boundary cases of
-`calculate_target` where "reward only" is genuinely the right answer. The twenty-five
-failures are all plain assertion failures or `DID NOT RAISE`, never import errors or
-crashes. If you see an error rather than a failure, something is wrong with the
-environment, not with your code — say so rather than working around it.
-
-## Expected state **after** you implement everything
-
-```
-$ pytest
-178 passed, 34 deselected
-
-$ pytest -m human_todo tests/human_todo
-34 passed
-```
-
-Plus the broad gates:
+The dry run reports the start distribution of all three schedules without training
+anything, in about a second:
 
 ```bash
-ruff format --check .
-ruff check .
-mypy
+python -m mars_rover_q.cli curriculum --scenario risk_value_tradeoff
 ```
 
-## The end-to-end check
+Measured on 2026-09-10, over the anneal:
 
-The tests prove the contracts. This proves the agent actually learns:
+```
+growing         distinct starts=1767/14298  easiest quarter=0.60 of episodes
+sliding         distinct starts=1836/14298  easiest quarter=0.17
+visit_weighted  distinct starts=1895/14298  easiest quarter=0.57
+```
+
+The dry run's synthetic counter increments only the sampled start, so it understates
+the tilt a real run gets from `visit_counts`; treat these as a lower bound and let
+Study 3 measure the rest.
+
+## The inner loop
+
+The full gate is 56s. For the edit-run-edit loop, deselect the two tests that render
+a matplotlib frame per battery level:
 
 ```bash
-python -m mars_rover_q.cli train \
-    --scenario safe_corridor --reward sparse --seed 1 \
-    --episodes 4000 --eval-episodes 200 \
-    --output artifacts/runs/handcheck
+pytest -m "not slow and not human_todo"
 ```
 
-What to look for:
+`368 passed in 11.6s`. **Both halves of that expression are needed.** A `-m` on the
+command line replaces `addopts`'s `-m 'not human_todo'` rather than combining with it,
+so a bare `-m "not slow"` silently pulls the teaching suite back in — it reports
+`483 passed` instead of `368`, and the extra 115 are tests the default run deliberately
+excludes.
 
-1. **No `TEACHING STATE` banner.** Its absence is the automatic signal that all five
-   functions now satisfy their contracts.
-2. The progress lines show `success=` climbing away from `0.00` as `eps` decays.
-3. `artifacts/runs/handcheck/manifest.json` contains `"learning_is_meaningful": true`.
-4. The printed evaluation summary shows a nonzero `success_rate`.
+The two `slow` tests are real coverage, not deadweight: they are the only assertions
+that a battery frame is written per battery level. Run the unfiltered `pytest` before
+calling anything done.
 
-Then watch it:
+## Where the time goes
 
-```bash
-python -m mars_rover_q.cli replay \
-    --run artifacts/runs/handcheck --episode best --policy-overlay
+Measured 2026-09-10, `pytest --durations`:
+
+```
+22.39s  test_cli.py::test_train_writes_a_battery_frame_per_battery_level        [slow]
+21.50s  test_run_figures.py::test_battery_set_holds_one_frame_per_battery_...   [slow]
+ 1.14s  test_experiment.py::test_sweep_results_do_not_depend_on_the_worker_count
+ 0.93s  test_experiment.py::test_sweep_writes_a_cell_per_budget_and_curriculum
+ ...
 ```
 
-`TAB` pauses, `.` single-steps, `[` / `]` change speed, `P` toggles the policy overlay,
-`Q` quits. A rover that drives to a sample, collects, and returns is worth more
-confidence than any single number.
-
-## Rules
-
-- **Do not edit anything under `tests/human_todo/`.** Not to skip, not to `xfail`, not
-  to relax a tolerance. Changing a test to match an implementation is not a pass, and
-  the review checks the diff.
-- **Do not touch `training.py` or `evaluation.py`.** They already call your functions
-  correctly. If the loop looks wrong to you, say so at review — do not silently patch it.
-- If a test in the green suite starts failing, you have changed something outside the
-  assignment. `git diff` will show what.
-
-When all of the above holds, return to Claude and say: **check my work**
+Before 2026-09-10 the suite was 2m25s: five `train` CLI tests that assert on manifests,
+coverage output and exit codes were rendering all 61 battery frames apiece because they
+passed no figure flag, and the interactive replay test ran at `fps=1.0`, which the
+renderer clamps at `max(1.0, speed)` and so really did sleep a second a frame. The
+`slow` marker existed but had been applied by intuition to seven `test_experiment.py`
+tests that take under a second each, so `-m "not slow"` saved nothing. It is now
+applied from the durations report.

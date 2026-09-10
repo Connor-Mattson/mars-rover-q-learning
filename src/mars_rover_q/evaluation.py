@@ -7,6 +7,7 @@ evaluation seed set that is separate from the training seeds.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -59,6 +60,7 @@ class EvaluationResult:
     records: list[EpisodeRecord]
     summary: EpisodeSummary
     best_trajectory: Trajectory | None = None
+    typical_trajectory: Trajectory | None = None
 
     def as_dict(self) -> dict[str, Any]:
         """A JSON-serialisable snapshot."""
@@ -79,6 +81,7 @@ def evaluate(
     potential_scale: float = 1.0,
     max_steps: int | None = None,
     capture_best: bool = True,
+    capture_typical: bool = False,
 ) -> EvaluationResult:
     """Run ``episodes`` greedy episodes and aggregate the reporting metrics.
 
@@ -99,6 +102,9 @@ def evaluate(
 
     records: list[EpisodeRecord] = []
     best: Trajectory | None = None
+    # Held only when asked for: a full batch of trajectories is far larger than the
+    # summary this function normally returns.
+    captured: list[Trajectory] = []
 
     for episode in range(episodes):
         observation, _ = env.reset()
@@ -143,13 +149,36 @@ def evaluate(
 
         if capture_best and (best is None or trajectory.base_return > best.base_return):
             best = trajectory
+        if capture_typical:
+            captured.append(trajectory)
 
     env.close()
     return EvaluationResult(
         records=records,
         summary=summarize_episodes(records),
         best_trajectory=best,
+        typical_trajectory=median_trajectory(captured) if captured else None,
     )
 
 
-__all__ = ["EVAL_SEED_OFFSET", "EvaluationResult", "Trajectory", "evaluate"]
+def median_trajectory(trajectories: Sequence[Trajectory]) -> Trajectory | None:
+    """The episode whose base return is closest to the batch median.
+
+    The *best* episode of a stochastic batch is a best case, and showing one as if
+    it were the policy's behaviour overstates it. This picks a representative run
+    instead: ties break toward the shorter episode, so the chosen one is typical in
+    length as well as in return.
+    """
+    if not trajectories:
+        return None
+    median = float(np.median([t.base_return for t in trajectories]))
+    return min(trajectories, key=lambda t: (abs(t.base_return - median), len(t.actions)))
+
+
+__all__ = [
+    "EVAL_SEED_OFFSET",
+    "EvaluationResult",
+    "Trajectory",
+    "evaluate",
+    "median_trajectory",
+]

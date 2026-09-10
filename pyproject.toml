@@ -37,7 +37,7 @@ testpaths = ["tests"]
 addopts = "-m 'not human_todo' --strict-markers"
 markers = [
     "human_todo: contract tests for the five human-owned functions; expected to FAIL until they are implemented",
-    "slow: longer-running integration tests",
+    "slow: integration tests that render a matplotlib frame per battery level; applied from measurement, not intuition -- see .teacher/how-to-test.md",
 ]
 filterwarnings = ["error::DeprecationWarning:mars_rover_q.*"]
 
@@ -52,9 +52,6 @@ ignore = ["RUF012"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["ARG001", "ARG002"]
-# The teaching stubs deliberately ignore most of their arguments; the real
-# implementations will use them, but the signatures are the published contract.
-"src/mars_rover_q/agent.py" = ["ARG001"]
 # Reward models implement a fixed RewardModel signature; not every condition needs
 # every part of the transition. B027: `reset` is an optional hook, not abstract.
 "src/mars_rover_q/rewards.py" = ["ARG002", "B027"]
