@@ -1,9 +1,10 @@
-"""Command-line entry points for play, train, evaluate, experiment, replay, and
+"""Command-line entry points for play, train, evaluate, experiment, tune, replay, and
 curriculum inspection."""
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 from itertools import pairwise
@@ -26,11 +27,60 @@ from .curriculum import (
 )
 from .evaluation import evaluate
 from .experiment import ExperimentConfig, json_safe, load_run, run_experiment, save_run, write_json
+from .numerics import install_numeric_guard
 from .rewards import RewardMode
 from .scenario import Scenario, available_scenarios, resolve_scenario
+from .state import NUM_PAYLOAD_STATES, BatteryEncoding
 from .training import TrainConfig, make_env, split_rngs, train
+from .tuning import (
+    DEFAULT_CHECKPOINT_EPISODES,
+    DEFAULT_CHECKPOINTS,
+    DEFAULT_STUDY_EPISODE_BUDGET,
+    DEFAULT_TRIAL_EPISODE_CAP,
+    TuningConfig,
+    run_study,
+)
 
 DEFAULT_ARTIFACT_ROOT = Path("artifacts")
+
+
+def _battery_encoding(args: argparse.Namespace) -> BatteryEncoding:
+    """Resolve the ``--dense-battery`` flag into a :class:`BatteryEncoding`."""
+    return (
+        BatteryEncoding.DENSE
+        if getattr(args, "dense_battery", False)
+        else BatteryEncoding.AFFORDABILITY
+    )
+
+
+def _run_battery_encoding(manifest: dict[str, Any]) -> BatteryEncoding:
+    """The battery encoding a saved run's table was built under.
+
+    Runs written before the encoding was configurable carry no such key, and every
+    one of them is dense -- that was the only encoding there was -- so the fallback
+    is ``DENSE`` rather than the current default. Reading an old run's table under
+    the new default would index a 24,400-row table as if it had 1,600 rows.
+    """
+    recorded = manifest.get("config", {}).get("battery_encoding")
+    return BatteryEncoding(recorded) if recorded else BatteryEncoding.DENSE
+
+
+def _add_dense_battery_flag(parser: argparse.ArgumentParser) -> None:
+    """Opt out of the binned battery axis, on the subcommands that build a table.
+
+    The default bins the battery at the round-trip cost of each sample -- the only
+    charge levels at which the best action can change -- which is one to two orders
+    of magnitude fewer rows than a row per reading. ``--dense-battery`` restores the
+    original encoding, which is the baseline the binning has to be measured against.
+    """
+    parser.add_argument(
+        "--dense-battery",
+        action="store_true",
+        help=(
+            "give every battery reading its own Q-table row instead of binning at "
+            "the samples' round-trip costs (far more rows; the original encoding)"
+        ),
+    )
 
 
 def _teaching_banner(stream: Any) -> None:
@@ -55,6 +105,7 @@ def cmd_play(args: argparse.Namespace) -> int:
         RewardMode(args.reward),
         gamma=args.gamma,
         rng=env_rng,
+        battery_encoding=_battery_encoding(args),
     )
     print(f"{scenario.name}: {scenario.description}")
     print("arrows/WASD drive, SPACE collect, R restart, P policy overlay, Q quit")
@@ -76,6 +127,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         learning_rate=args.learning_rate,
         gamma=args.gamma,
         initial_q=args.initial_q,
+        battery_encoding=_battery_encoding(args),
         epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
         curriculum_fraction=args.curriculum_fraction,
@@ -93,6 +145,7 @@ def cmd_train(args: argparse.Namespace) -> int:
             episodes=args.eval_episodes,
             seed=args.seed,
             gamma=args.gamma,
+            battery_encoding=config.battery_encoding,
         )
         if args.eval_episodes > 0
         else None
@@ -115,6 +168,7 @@ def cmd_train(args: argparse.Namespace) -> int:
                 initial_q=config.initial_q,
                 config=config.as_dict(),
                 battery_frames=not args.no_battery_figs,
+                battery_encoding=config.battery_encoding,
             )
         )
     # State coverage is the diagnostic that motivated the curriculum: a table whose
@@ -146,6 +200,7 @@ def _write_figures(
     initial_q: float,
     config: dict[str, Any],
     battery_frames: bool = True,
+    battery_encoding: BatteryEncoding = BatteryEncoding.AFFORDABILITY,
 ) -> list[Path]:
     """Draw the per-run figures. Imported lazily: matplotlib is slow to import and
     every other subcommand gets by without it."""
@@ -159,15 +214,17 @@ def _write_figures(
         initial_q=initial_q,
         subtitle=run_subtitle(config),
         battery_frames=battery_frames,
+        binning=scenario.battery_binning(battery_encoding),
     )
 
 
 def _report_figures(paths: list[Path]) -> None:
     """Name the summary figures; count the battery frames.
 
-    The battery set is one figure per battery level, so listing it a line at a time
-    would bury the run summary underneath sixty-odd paths that differ in two
-    characters. The directory is the useful address for a set.
+    The battery set is one figure per battery level, so under the dense encoding
+    listing it a line at a time would bury the run summary underneath sixty-odd
+    paths that differ in two characters. The directory is the useful address for a
+    set.
     """
     from .run_figures import BATTERY_FIGS_DIRNAME
 
@@ -198,6 +255,7 @@ def cmd_figures(args: argparse.Namespace) -> int:
             initial_q=float(config.get("initial_q", 0.0)),
             config=config,
             battery_frames=not args.no_battery_figs,
+            battery_encoding=_run_battery_encoding(run.manifest),
         )
     )
     return 0
@@ -217,8 +275,9 @@ def _add_curriculum_strategy_flags(parser: argparse.ArgumentParser) -> None:
         choices=[strategy.value for strategy in CurriculumStrategy],
         help=(
             "how the curriculum draws from the ranked pool: a growing window "
-            "(uniform over the easiest k), a sliding window of fixed width, or a "
-            "growing window weighted against already-updated states"
+            "(uniform over the easiest k), a sliding window of fixed width, a "
+            "growing window weighted against already-updated states, or exploring "
+            "starts (uniform over the whole pool, no anneal)"
         ),
     )
     parser.add_argument(
@@ -263,6 +322,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         episodes=args.episodes,
         seed=args.seed,
         gamma=run.manifest["config"]["gamma"],
+        battery_encoding=_run_battery_encoding(run.manifest),
     )
     print(json.dumps(json_safe(result.summary.as_dict()), indent=2))
     if args.output:
@@ -292,6 +352,107 @@ def cmd_experiment(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     return 0
+
+
+def _tuning_config(args: argparse.Namespace) -> TuningConfig:
+    """Build the search config from a JSON file, a set of flags, or both.
+
+    A flag overrides the file only when it was actually passed: every override below
+    defaults to ``None`` rather than to the config's own default, so loading a tuned
+    search definition and changing one thing on the command line does not silently
+    reset the rest of it.
+    """
+    config = TuningConfig.from_file(args.config) if args.config else TuningConfig()
+    overrides: dict[str, Any] = {
+        "scenario": args.scenario,
+        "reward_mode": RewardMode(args.reward) if args.reward else None,
+        "seeds": tuple(int(s) for s in args.seeds.split(",")) if args.seeds else None,
+        "trial_episode_cap": args.trial_episodes,
+        "study_episode_budget": args.total_episodes,
+        "max_trials": args.trials,
+        "checkpoints": args.checkpoints,
+        "checkpoint_episodes": args.checkpoint_episodes,
+        "eval_episodes": args.eval_episodes,
+        "sampler_seed": args.sampler_seed,
+        "battery_encoding": BatteryEncoding.DENSE if args.dense_battery else None,
+        "search_curriculum": False if args.no_curriculum_search else None,
+        "confirm_best": False if args.no_confirm_best else None,
+    }
+    return dataclasses.replace(
+        config, **{key: value for key, value in overrides.items() if value is not None}
+    )
+
+
+def cmd_tune(args: argparse.Namespace) -> int:
+    """Search hyper-parameters with Optuna under a bounded episode budget."""
+    config = _tuning_config(args)
+    output_root = Path(args.output) if args.output else DEFAULT_ARTIFACT_ROOT / config.name
+    _teaching_banner(sys.stderr)
+    payload = run_study(config, output_root, make_plots=not args.no_plots)
+    print(f"\nstudy written to {output_root}")
+    _print_study(payload, top=args.top)
+    if not payload["search_is_meaningful"]:
+        print(
+            "TEACHING STATE: the search objective is stubbed; this ranking is not a "
+            "ranking. Do not report these numbers.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _print_study(payload: dict[str, Any], top: int = 5) -> None:
+    """Print the budget actually spent, the top trials, and the Pareto front."""
+    budget = payload["budget"]
+    trials = payload["trials"]
+    pruned = sum(1 for trial in trials if trial["pruned"])
+    print(
+        f"{len(trials)} trials ({pruned} pruned), "
+        f"{budget['spent']:,}/{budget['total']:,} episodes spent"
+    )
+
+    scored = sorted(
+        (t for t in trials if t["score"] is not None),
+        key=lambda t: (-float(t["score"]), t["number"]),
+    )
+    if not scored:
+        print("no trial completed: nothing to rank")
+        return
+    print(f"\ntop {min(top, len(scored))} by objective score")
+    for trial in scored[:top]:
+        print(
+            f"  #{trial['number']:<3} score={float(trial['score']):0.4f}  "
+            f"best={trial['best_return']:7.2f} @ {trial['episodes_to_best']:>6} ep  "
+            f"final={trial['final_return']:7.2f}"
+        )
+        print(f"       {_format_params(trial['params'])}")
+
+    front = payload["pareto_front"]
+    by_number = {t["number"]: t for t in trials}
+    print("\npareto front (cannot do better without spending more episodes)")
+    if not front:
+        print("  unavailable")
+    for number in front:
+        trial = by_number[number]
+        print(
+            f"  #{number:<3} best={trial['best_return']:7.2f} @ "
+            f"{trial['episodes_to_best']:>6} episodes"
+        )
+    confirmation = payload.get("confirmation_run")
+    if confirmation is not None:
+        print(
+            f"\nconfirmation run of trial #{confirmation['trial_number']}: "
+            f"success={confirmation['eval_success_rate']:0.2f}  "
+            f"base_return={confirmation['eval_mean_base_return']:0.2f}  "
+            f"-> {confirmation['run_dir']}"
+        )
+
+
+def _format_params(params: dict[str, Any]) -> str:
+    """One-line rendering of a trial's suggested parameters."""
+    parts = []
+    for key, value in sorted(params.items()):
+        parts.append(f"{key}={value:0.4g}" if isinstance(value, float) else f"{key}={value}")
+    return "  ".join(parts)
 
 
 def _print_sweep_analysis(analysis: dict[str, Any]) -> None:
@@ -361,7 +522,13 @@ def cmd_replay(args: argparse.Namespace) -> int:
     if run.best_trajectory is None:
         raise SystemExit(f"{run.root} has no stored best episode; run evaluate first")
     policy = run.policy if args.policy_overlay else None
-    replay_trajectory(run.scenario, run.best_trajectory, policy=policy, fps=args.fps)
+    replay_trajectory(
+        run.scenario,
+        run.best_trajectory,
+        policy=policy,
+        fps=args.fps,
+        battery_encoding=_run_battery_encoding(run.manifest),
+    )
     return 0
 
 
@@ -493,14 +660,19 @@ def cmd_scenarios(args: argparse.Namespace) -> int:
     for name in available_scenarios():
         scenario = resolve_scenario(name)
         target = scenario.heuristic_target_sample()
+        cells = scenario.rows * scenario.cols * NUM_PAYLOAD_STATES
+        binning = scenario.battery_binning()
         print(
             f"{name:<22} {scenario.rows}x{scenario.cols}  "
             f"battery={scenario.battery_capacity:<4} steps={scenario.max_steps:<4} "
-            f"states={scenario.rows * scenario.cols * (scenario.battery_capacity + 1) * 4:<8} "
+            f"states={cells * binning.levels:<7} "
+            f"dense={cells * (scenario.battery_capacity + 1):<7} "
             f"subgoal={target.name.lower()}"
         )
         if scenario.description:
             print(f"{'':<22} {scenario.description}")
+        bins = "  ".join(binning.label(level) for level in range(binning.levels))
+        print(f"{'':<22} battery bins: {bins}")
     return 0
 
 
@@ -519,6 +691,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     play.add_argument("--seed", type=int, default=0)
     play.add_argument("--gamma", type=float, default=0.99)
+    _add_dense_battery_flag(play)
     play.set_defaults(func=cmd_play)
 
     trainer = subparsers.add_parser("train", help="train one Q-table and save a run directory")
@@ -531,6 +704,7 @@ def build_parser() -> argparse.ArgumentParser:
     trainer.add_argument("--learning-rate", type=float, default=0.2)
     trainer.add_argument("--gamma", type=float, default=0.99)
     trainer.add_argument("--initial-q", type=float, default=0.0)
+    _add_dense_battery_flag(trainer)
     trainer.add_argument("--epsilon-start", type=float, default=1.0)
     trainer.add_argument("--epsilon-end", type=float, default=0.05)
     trainer.add_argument(
@@ -581,6 +755,72 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     experiment.set_defaults(func=cmd_experiment)
+
+    tune = subparsers.add_parser(
+        "tune",
+        help="search hyper-parameters with Optuna under a bounded episode budget",
+    )
+    tune.add_argument("--config", default=None, help="search definition JSON")
+    tune.add_argument("--scenario", default=None)
+    tune.add_argument("--reward", default=None, choices=[m.value for m in RewardMode])
+    tune.add_argument(
+        "--seeds",
+        default=None,
+        help="comma-separated training seeds averaged within each trial (default: 1)",
+    )
+    tune.add_argument(
+        "--trial-episodes",
+        type=int,
+        default=None,
+        help=(
+            "episode budget per trial per seed; deliberately below convergence so that "
+            f"learning speed still separates settings (default: {DEFAULT_TRIAL_EPISODE_CAP})"
+        ),
+    )
+    tune.add_argument(
+        "--total-episodes",
+        type=int,
+        default=None,
+        help=(
+            "total training episodes the whole search may spend; the study stops when "
+            f"what remains cannot fund another trial (default: {DEFAULT_STUDY_EPISODE_BUDGET})"
+        ),
+    )
+    tune.add_argument(
+        "--trials",
+        type=int,
+        default=None,
+        help="optional hard cap on trial count, applied on top of the episode budget",
+    )
+    tune.add_argument(
+        "--checkpoints",
+        type=int,
+        default=None,
+        help=f"learning-curve points per trial (default: {DEFAULT_CHECKPOINTS})",
+    )
+    tune.add_argument(
+        "--checkpoint-episodes",
+        type=int,
+        default=None,
+        help=f"greedy episodes per checkpoint (default: {DEFAULT_CHECKPOINT_EPISODES})",
+    )
+    tune.add_argument("--eval-episodes", type=int, default=None)
+    tune.add_argument("--sampler-seed", type=int, default=None)
+    _add_dense_battery_flag(tune)
+    tune.add_argument(
+        "--no-curriculum-search",
+        action="store_true",
+        help="hold the start-state curriculum off and search the agent knobs only",
+    )
+    tune.add_argument(
+        "--no-confirm-best",
+        action="store_true",
+        help="skip re-training the winning configuration into a full run directory",
+    )
+    tune.add_argument("--output", default=None, help="output root (default under artifacts/)")
+    tune.add_argument("--no-plots", action="store_true")
+    tune.add_argument("--top", type=int, default=5, help="how many trials to print")
+    tune.set_defaults(func=cmd_tune)
 
     analyze = subparsers.add_parser(
         "analyze", help="re-analyse and re-plot a finished experiment from its summary.json"
@@ -634,7 +874,7 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point. Returns a process exit code."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    np.seterr(all="raise")
+    install_numeric_guard()
     handler: Any = args.func
     result: int = handler(args)
     return result

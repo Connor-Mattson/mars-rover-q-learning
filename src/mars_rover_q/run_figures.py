@@ -19,11 +19,12 @@ The third figure is a set, not a single image. Both top-level maps sum battery
 away, which is the only way to fit the table on one page but also throws away the
 axis the mission actually turns on -- the same cell is a good place to stand with
 a full battery and a fatal one with eight percent left. ``figs/q_by_battery/``
-holds one map per battery reading with nothing marginalised: every panel is a
-fully specified state, painted by its learned value, labelled with the update count
-behind that value, and arrowed with the action that value came from. Every frame in
-the set shares one colour scale, so the frames can be flipped through as a sequence
-and compared to each other.
+holds one map per battery *level* with nothing marginalised: every panel is a table
+row, painted by its learned value, labelled with the update count behind that value,
+and arrowed with the action that value came from. Under the dense encoding a level
+is one exact battery reading; under the binned one it is the range of readings that
+share a row, which each frame names. Every frame in the set shares one colour scale,
+so the frames can be flipped through as a sequence and compared to each other.
 
 Figures are drawn from the finished table and the recorded visit counts, so they
 describe the run that happened; nothing here re-steps the environment. Like
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +66,7 @@ from .state import (
     COLLECTABLE_SAMPLES,
     NUM_PAYLOAD_STATES,
     SAMPLE_LABELS,
+    BatteryBinning,
     SampleType,
     StateEncoder,
 )
@@ -220,12 +223,20 @@ class PayloadCoverage:
     payload: SampleType
     learned: int
     total: int
+    #: States in this slice the rover can actually be in with a move still to make.
+    #: Varies by payload: the further the carried sample is from the lander, the
+    #: more of the battery axis is already spent by the time the bay holds it.
     reachable: int
 
     @property
     def fraction(self) -> float:
         """Share of this slice's states carrying a learned value."""
         return self.learned / self.total if self.total else 0.0
+
+    @property
+    def reachable_fraction(self) -> float:
+        """Share of this slice's occupiable states carrying a learned value."""
+        return self.learned / self.reachable if self.reachable else 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,28 +256,32 @@ class CoverageReport:
 
     @property
     def reachable_fraction(self) -> float:
-        """Share of the states on traversable ground carrying a learned value."""
+        """Share of the states the rover can occupy carrying a learned value."""
         return self.learned / self.reachable if self.reachable else 0.0
 
 
 def coverage_report(
-    scenario: Scenario, q_table: NDArray[np.float64], *, initial_q: float = 0.0
+    scenario: Scenario,
+    q_table: NDArray[np.float64],
+    *,
+    initial_q: float = 0.0,
+    binning: BatteryBinning | None = None,
 ) -> CoverageReport:
     """Count the states this run wrote to, whole-table and per payload.
 
-    ``reachable`` is the count of states standing on a non-wall cell. It is the
-    ceiling a run could conceivably reach, and it matters: a third of
-    ``safe_corridor``'s grid is wall, so coverage measured against every encodable
-    state understates what the run covered by exactly that third. Both denominators
-    are reported rather than picking one.
+    ``reachable`` is :func:`occupiable_state_mask`: the states the rover can be in
+    with a move still to make. It is the ceiling a run could conceivably reach, and
+    it matters twice over. A third of ``safe_corridor``'s grid is wall, so coverage
+    against every encodable state understates the run by exactly that third. And
+    the ceiling is *not* the same for all four payload slices -- carrying a sample
+    means having already paid for the trip out to it, so the charge left is capped
+    by how far that sample is from the lander. Both denominators are reported
+    rather than picking one.
     """
-    encoder = _encoder_for(scenario)
+    encoder = _encoder_for(scenario, binning)
     mask = learned_state_mask(q_table, initial_q)
     learned_grid = encoder.grid_view(mask)
-    traversable = _traversable_mask(scenario)
-    # Every battery level of every payload sits on the same cell, so the reachable
-    # count per payload is just the traversable cell count times the battery levels.
-    reachable_per_payload = int(traversable.sum()) * encoder.battery_levels
+    occupiable = occupiable_state_mask(scenario, encoder)
     total_per_payload = encoder.rows * encoder.cols * encoder.battery_levels
 
     by_payload = tuple(
@@ -274,14 +289,14 @@ def coverage_report(
             payload=SampleType(index),
             learned=int(learned_grid[:, :, :, index].sum()),
             total=total_per_payload,
-            reachable=reachable_per_payload,
+            reachable=int(occupiable[:, :, :, index].sum()),
         )
         for index in range(NUM_PAYLOAD_STATES)
     )
     return CoverageReport(
         total=encoder.num_states,
         learned=int(mask.sum()),
-        reachable=reachable_per_payload * NUM_PAYLOAD_STATES,
+        reachable=int(occupiable.sum()),
         initial_q=initial_q,
         by_payload=by_payload,
     )
@@ -304,9 +319,14 @@ class ExperienceField:
     log: bool
 
 
-def visit_field(scenario: Scenario, visit_counts: NDArray[np.int64]) -> ExperienceField:
+def visit_field(
+    scenario: Scenario,
+    visit_counts: NDArray[np.int64],
+    *,
+    binning: BatteryBinning | None = None,
+) -> ExperienceField:
     """Q-updates per cell and payload, battery summed away."""
-    grid = _encoder_for(scenario).grid_view(np.asarray(visit_counts))
+    grid = _encoder_for(scenario, binning).grid_view(np.asarray(visit_counts))
     return ExperienceField(
         counts=np.asarray(grid.sum(axis=2), dtype=np.float64),
         scale_label="Q-updates made in this cell (log scale)",
@@ -316,7 +336,11 @@ def visit_field(scenario: Scenario, visit_counts: NDArray[np.int64]) -> Experien
 
 
 def learned_battery_field(
-    scenario: Scenario, q_table: NDArray[np.float64], *, initial_q: float = 0.0
+    scenario: Scenario,
+    q_table: NDArray[np.float64],
+    *,
+    initial_q: float = 0.0,
+    binning: BatteryBinning | None = None,
 ) -> ExperienceField:
     """Fallback for runs saved before visit counts were recorded.
 
@@ -325,7 +349,7 @@ def learned_battery_field(
     battery level count and cannot tell one update from ten thousand -- so it is
     labelled differently rather than passed off as the same measurement.
     """
-    encoder = _encoder_for(scenario)
+    encoder = _encoder_for(scenario, binning)
     grid = encoder.grid_view(learned_state_mask(q_table, initial_q))
     return ExperienceField(
         counts=np.asarray(grid.sum(axis=2), dtype=np.float64),
@@ -370,10 +394,14 @@ class QValueField:
     reached: NDArray[np.bool_]
     decided: NDArray[np.bool_]
     has_counts: bool
+    #: How axis 2 maps onto real battery readings. Under the dense encoding level
+    #: ``k`` *is* battery ``k``; under a coarser one it is a range, and every label
+    #: on these figures has to say which.
+    binning: BatteryBinning
 
     @property
     def battery_levels(self) -> int:
-        """Number of distinct battery readings, i.e. how many frames the set holds."""
+        """Number of battery bins, i.e. how many frames the set holds."""
         return int(self.values.shape[2])
 
 
@@ -383,6 +411,7 @@ def q_value_field(
     *,
     visit_counts: NDArray[np.int64] | None = None,
     initial_q: float = 0.0,
+    binning: BatteryBinning | None = None,
 ) -> QValueField:
     """Greedy values and update counts per fully specified state.
 
@@ -392,7 +421,7 @@ def q_value_field(
     indistinguishable from one never visited once the counts are gone -- so the
     fallback under-reports coverage rather than guessing at it.
     """
-    encoder = _encoder_for(scenario)
+    encoder = _encoder_for(scenario, binning)
     table = np.asarray(q_table, dtype=np.float64)
     best = table.max(axis=1)
     values = encoder.grid_view(best)
@@ -414,6 +443,7 @@ def q_value_field(
         reached=np.asarray(reached, dtype=np.bool_),
         decided=np.asarray(decided, dtype=np.bool_),
         has_counts=counts is not None,
+        binning=encoder.binning,
     )
 
 
@@ -443,19 +473,24 @@ def battery_q_figure(
     output_path: Path,
     scenario: Scenario,
     field: QValueField,
-    battery: int,
+    level: int,
     *,
     norm: TwoSlopeNorm,
     subtitle: str = "",
 ) -> Path:
-    """One frame of the battery set: the whole map at a single battery reading.
+    """One frame of the battery set: the whole map at a single battery level.
 
-    Nothing on this page is summed or averaged. Each cell is one state, and its two
-    labels are that state's greedy value and the number of updates that produced it.
+    Nothing on this page is summed or averaged over the map. Each cell is one table
+    row, and its two labels are that row's greedy value and the number of updates
+    that produced it. Under the dense encoding a row is one exact state; under a
+    binned one it is every state in the frame's battery range, which the title and
+    the gauge both name.
     """
     ramp = diverging_q_ramp()
     walls = ~_traversable_mask(scenario)
-    capacity = field.battery_levels - 1
+    binning = field.binning
+    capacity = binning.capacity
+    low, high = binning.span(level)
 
     fig, axes = plt.subplots(2, 2, figsize=(11.5, 12.0))
     fig.patch.set_facecolor("white")
@@ -463,12 +498,12 @@ def battery_q_figure(
 
     payloads = (SampleType.NONE, *COLLECTABLE_SAMPLES)
     for axis, payload in zip(axes.flat, payloads, strict=True):
-        _draw_q_panel(axis, scenario, field, payload, battery, walls=walls, norm=norm, ramp=ramp)
+        _draw_q_panel(axis, scenario, field, payload, level, walls=walls, norm=norm, ramp=ramp)
 
     fig.text(
         0.05,
         0.962,
-        f"What the table learned at battery {battery} of {capacity}",
+        f"What the table learned at battery {binning.label(level)} of {capacity}",
         fontsize=16,
         fontweight="bold",
         color=TEXT_PRIMARY,
@@ -485,17 +520,18 @@ def battery_q_figure(
         else "This run recorded no visit counts, so the updates behind each value "
         f"are not shown. All {field.battery_levels} frames share this colour scale."
     )
-    fig.text(
-        0.05,
-        0.914,
+    first_line = (
         "Each cell is one exact state, painted by the value of its best action; "
-        "the arrow is that action.",
-        fontsize=9.5,
-        color=TEXT_SECONDARY,
+        "the arrow is that action."
+        if binning.is_dense
+        else f"Each cell is one table row -- every battery reading from {low} to "
+        f"{high} shares it -- painted by the value of its best action; the arrow "
+        "is that action."
     )
+    fig.text(0.05, 0.914, first_line, fontsize=9.5, color=TEXT_SECONDARY)
     fig.text(0.05, 0.896, second_line, fontsize=9.5, color=TEXT_SECONDARY)
 
-    _draw_battery_gauge(fig, battery, capacity)
+    _draw_battery_gauge(fig, low, high, capacity)
 
     glyph_note = "     ".join(
         [f"{LANDER_GLYPH}  lander"]
@@ -561,11 +597,14 @@ def write_battery_q_figures(
     *,
     subtitle: str = "",
 ) -> list[Path]:
-    """Write one value map per battery reading into ``figs_dir/q_by_battery``.
+    """Write one value map per battery level into ``figs_dir/q_by_battery``.
 
-    The frames are named with a zero-padded battery reading so that a directory
+    The frames are named with a zero-padded *level* index so that a directory
     listing, an image viewer's arrow keys, and ``ffmpeg`` all walk them in the order
-    the battery actually drains.
+    the battery actually drains. Under the dense encoding the level is the battery
+    reading and the names are unchanged; under a binned one it is the bin index, and
+    the reading range it covers is on the frame itself rather than in the filename,
+    which has to stay sortable.
     """
     battery_dir = Path(figs_dir) / BATTERY_FIGS_DIRNAME
     battery_dir.mkdir(parents=True, exist_ok=True)
@@ -574,14 +613,14 @@ def write_battery_q_figures(
     width = len(str(field.battery_levels - 1))
     return [
         battery_q_figure(
-            battery_dir / f"{BATTERY_FIG_STEM}_{battery:0{width}d}.png",
+            battery_dir / f"{BATTERY_FIG_STEM}_{level:0{width}d}.png",
             scenario,
             field,
-            battery,
+            level,
             norm=norm,
             subtitle=subtitle,
         )
-        for battery in range(field.battery_levels)
+        for level in range(field.battery_levels)
     ]
 
 
@@ -616,8 +655,8 @@ def state_coverage_figure(output_path: Path, report: CoverageReport, *, subtitle
     fig.text(
         0.06,
         0.725,
-        f"hold a value this run wrote. Against the {report.reachable:,} states standing on "
-        f"traversable ground, {report.reachable_fraction:.1%}.",
+        f"hold a value this run wrote. Against the {report.reachable:,} states the rover can "
+        f"actually occupy, {report.reachable_fraction:.1%}.",
         fontsize=10,
         color=TEXT_SECONDARY,
     )
@@ -647,7 +686,7 @@ def state_coverage_figure(output_path: Path, report: CoverageReport, *, subtitle
         ax.text(
             row.total * 1.02,
             position,
-            f"{row.learned:,}  ({row.fraction:.1%})",
+            f"{row.learned:,}  ({row.reachable_fraction:.1%} of reachable)",
             va="center",
             ha="left",
             fontsize=9.5,
@@ -781,6 +820,7 @@ def write_run_figures(
     initial_q: float = 0.0,
     subtitle: str = "",
     battery_frames: bool = True,
+    binning: BatteryBinning | None = None,
 ) -> list[Path]:
     """Write every per-run figure into ``run_dir/figs`` and return their paths.
 
@@ -799,22 +839,33 @@ def write_run_figures(
     ``battery_frames`` exists because the set is one figure per battery level and
     costs proportionally more than the two summaries put together; a caller redrawing
     figures in a loop over many runs may not want it every time.
+
+    ``binning`` is the battery axis ``q_table`` was written under, and every figure
+    here reads the table through it. It defaults to dense because that is what a run
+    with nothing recorded about its encoding is; callers holding a manifest should
+    pass the run's own.
     """
     figs_dir = Path(run_dir) / FIGS_DIRNAME
     figs_dir.mkdir(parents=True, exist_ok=True)
 
-    report = coverage_report(scenario, q_table, initial_q=initial_q)
+    report = coverage_report(scenario, q_table, initial_q=initial_q, binning=binning)
     field = (
-        visit_field(scenario, visit_counts)
+        visit_field(scenario, visit_counts, binning=binning)
         if visit_counts is not None and visit_counts.size
-        else learned_battery_field(scenario, q_table, initial_q=initial_q)
+        else learned_battery_field(scenario, q_table, initial_q=initial_q, binning=binning)
     )
     paths = [
         state_coverage_figure(figs_dir / COVERAGE_FIG, report, subtitle=subtitle),
         experience_heatmap_figure(figs_dir / EXPERIENCE_FIG, scenario, field, subtitle=subtitle),
     ]
     if battery_frames:
-        values = q_value_field(scenario, q_table, visit_counts=visit_counts, initial_q=initial_q)
+        values = q_value_field(
+            scenario,
+            q_table,
+            visit_counts=visit_counts,
+            initial_q=initial_q,
+            binning=binning,
+        )
         paths.extend(write_battery_q_figures(figs_dir, scenario, values, subtitle=subtitle))
     return paths
 
@@ -835,13 +886,75 @@ def run_subtitle(config: dict[str, Any]) -> str:
 # -- internals ------------------------------------------------------------
 
 
-def _encoder_for(scenario: Scenario) -> StateEncoder:
-    return StateEncoder(scenario.rows, scenario.cols, scenario.battery_capacity)
+def _encoder_for(scenario: Scenario, binning: BatteryBinning | None = None) -> StateEncoder:
+    """The encoder a figure has to read a saved table through.
+
+    ``binning`` defaults to dense rather than to the current training default: these
+    functions are handed tables loaded from disk, and a table's battery axis is a
+    property of the run that wrote it, never of the version drawing it.
+    """
+    return StateEncoder(scenario.rows, scenario.cols, scenario.battery_capacity, binning)
 
 
 def _traversable_mask(scenario: Scenario) -> NDArray[np.bool_]:
     """``(rows, cols)`` boolean: which cells are not wall."""
     return np.asarray(scenario.grid != int(Terrain.WALL), dtype=np.bool_)
+
+
+def occupiable_state_mask(scenario: Scenario, encoder: StateEncoder) -> NDArray[np.bool_]:
+    """``(rows, cols, battery_levels, payloads)`` boolean: which states can be acted from.
+
+    The ceiling every coverage figure is measured against. A state qualifies only
+    when the rover could actually be sitting in it with a move still to make, which
+    is the same three-part test :meth:`MarsRoverEnv._validated_start` applies to an
+    injected start:
+
+    * **The cell is not wall.**
+    * **The battery arithmetic works out.** The rover leaves the lander with a full
+      charge and pays the energy cost of every tile it enters, so the charge missing
+      from a state is at least the cheapest route that explains it -- straight from
+      the lander with an empty bay, and via the carried sample's own cell plus
+      ``collect_energy_cost`` when the bay is full. A battery level is occupiable
+      when *some* reading in its bin is payable that way. Wandering can always spend
+      more; nothing can spend less.
+    * **The state is not already terminal.** A flat battery ends the episode, and so
+      does arriving on the lander with a sample aboard -- that is the delivery. Both
+      are entered and never acted from, so no Q-update ever writes their rows.
+
+    Note:
+        This is per payload, and deliberately so. Sharing one traversable-cell count
+        across all four slices treats a state the map makes impossible -- a full
+        battery while carrying a sample fetched from the far end of the corridor --
+        as a state the run failed to reach, which reads on the figure as a
+        curriculum that never got to the valuable payloads. Distances are the static
+        Dijkstra fields, so slip is ignored: this is a bound, not a prediction.
+    """
+    binning = encoder.binning
+    capacity = scenario.battery_capacity
+    mask = np.zeros(
+        (encoder.rows, encoder.cols, encoder.battery_levels, NUM_PAYLOAD_STATES), dtype=np.bool_
+    )
+    for payload in (SampleType.NONE, *COLLECTABLE_SAMPLES):
+        for cell in scenario.traversable_cells():
+            if payload is SampleType.NONE:
+                spent = scenario.distance(scenario.lander, cell)
+            elif cell == scenario.lander:
+                continue  # carrying a sample onto the lander is the delivery
+            else:
+                sample_cell = scenario.samples[payload].position
+                spent = (
+                    scenario.distance(scenario.lander, sample_cell)
+                    + scenario.collect_energy_cost
+                    + scenario.distance(sample_cell, cell)
+                )
+            if not isfinite(spent) or spent > capacity - 1:
+                continue
+            highest = int(capacity - spent)
+            for level in range(encoder.battery_levels):
+                low, high = binning.span(level)
+                if low <= highest and high >= 1:
+                    mask[cell[0], cell[1], level, int(payload)] = True
+    return mask
 
 
 def _recede_axes(axis: Any) -> None:
@@ -946,20 +1059,28 @@ def _norm_bounds(norm: Normalize) -> tuple[float, float]:
     )
 
 
-def _draw_battery_gauge(figure: Any, battery: int, capacity: int) -> None:
+def _draw_battery_gauge(figure: Any, low: int, high: int, capacity: int) -> None:
     """A slim charge bar under the header, so a frame is placeable at a glance.
 
     The frames are meant to be flipped through, and a reader three frames deep has
     lost track of where in the drain they are; a title number alone does not restore
     that, a bar filled to the same fraction the rover has left does.
+
+    A frame covers a *range* of readings -- one reading wide under the dense
+    encoding, wider under a binned one -- so the bar is filled solid to ``low``, the
+    charge every state in the frame is guaranteed, and continues in a lighter tone
+    to ``high``. Drawing the bin at its top instead would show a charge most of its
+    states do not have.
     """
     # Deliberately short of the page width: a full battery drawn edge to edge reads
     # as a rule under the header rather than as a bar filled to its end.
     axis = figure.add_axes((0.05, 0.874, 0.34, 0.009))
     axis.barh(0, capacity, height=1.0, color=UNTOUCHED_INK)
+    if high > low:
+        axis.barh(0, high, height=1.0, color=TEXT_SECONDARY, alpha=0.35)
     # Not the wall grey: a bar drawn in the same ink as the map's walls invites the
     # reader to look for a relationship between the two, and there is none.
-    axis.barh(0, battery, height=1.0, color=TEXT_SECONDARY)
+    axis.barh(0, low, height=1.0, color=TEXT_SECONDARY)
     axis.set_xlim(0, capacity)
     axis.set_ylim(-0.5, 0.5)
     axis.set_xticks([])
@@ -973,18 +1094,18 @@ def _draw_q_panel(
     scenario: Scenario,
     field: QValueField,
     payload: SampleType,
-    battery: int,
+    level: int,
     *,
     walls: NDArray[np.bool_],
     norm: TwoSlopeNorm,
     ramp: LinearSegmentedColormap,
 ) -> None:
-    """Paint one payload's map at one battery reading, with both per-cell labels."""
-    values = field.values[:, :, battery, int(payload)]
-    actions = field.actions[:, :, battery, int(payload)]
-    updates = field.updates[:, :, battery, int(payload)]
-    reached = field.reached[:, :, battery, int(payload)] & ~walls
-    decided = field.decided[:, :, battery, int(payload)] & reached
+    """Paint one payload's map at one battery level, with both per-cell labels."""
+    values = field.values[:, :, level, int(payload)]
+    actions = field.actions[:, :, level, int(payload)]
+    updates = field.updates[:, :, level, int(payload)]
+    reached = field.reached[:, :, level, int(payload)] & ~walls
+    decided = field.decided[:, :, level, int(payload)] & reached
     rows, cols = values.shape
 
     image = np.empty((rows, cols, 3), dtype=np.float64)
@@ -1140,6 +1261,7 @@ __all__ = [
     "diverging_q_ramp",
     "experience_heatmap_figure",
     "learned_battery_field",
+    "occupiable_state_mask",
     "plural",
     "q_value_field",
     "q_value_norm",

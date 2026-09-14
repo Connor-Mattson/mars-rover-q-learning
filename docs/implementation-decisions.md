@@ -24,11 +24,56 @@ terrain keeps the transition a function of the current state alone, which is wha
 Arriving home on the last joule completes the mission. The opposite convention would
 make a perfectly executed, perfectly budgeted mission read as a failure.
 
-**Battery is stored as an exact integer, not binned.**
-Measured table sizes are 24,400 / 40,896 / 104,256 states (× 5 actions) for the three
-bundled scenarios — at most about 2.1 MB of `float64`. No binning is needed, so none was
-introduced. If a future scenario forces a change, document it here *before*
-implementing it.
+**Battery is exact in the environment and binned in the table, at the samples'
+mission costs.**
+*Supersedes an earlier entry that read "battery is stored as an exact integer, not
+binned", on the grounds that the tables were small enough in bytes that no binning was
+needed. That was the wrong measure. Recorded after the change rather than before it,
+which the workflow asks for the other way round.*
+
+Memory was never the problem; **statistical** cost was. Under the dense encoding a
+cell's 61 battery copies are 61 unrelated table rows that share no experience, and the
+positional signal has to survive that many layers of chained bootstrapping. In the
+`safe_corridor__sparse__seed1` run it did not: at battery 55 the learned value is
+`79.775` at `(5,1)`, `(5,2)`, `(5,3)`, `(5,4)` and `(6,4)` alike — identical to five
+decimals across the whole corridor, rising by exactly `1/gamma` per unit of charge. The
+table had learned one scalar, "I will deliver the 90-point sample, discounted by how
+much battery I have burned", with no positional structure left in it. At the canonical
+start all five actions were equal to ten decimal places after 105,125 visits, so the
+first action of the mission was a coin toss.
+
+The bin edges are each sample's **mission cost** — its lander round trip plus the
+`COLLECT` charge, the exact charge below which that sample stops being deliverable.
+Between two adjacent edges the affordable set is constant and so is the decision the
+rover faces; the readings in between differ only by a factor of `gamma`, which the
+discount already accounts for. All three bundled maps have three distinct costs and
+therefore four bins: 1,600 / 2,304 / 2,304 rows against 24,400 / 40,896 / 104,256.
+
+Checked before it was made the default, by solving each scenario exactly (value
+iteration on the full battery-aware MDP) and then computing the best policy available
+to a coarser state, by policy iteration within that restricted class:
+
+| Scenario | `V*(start)` | best 4-bin policy | best battery-free policy |
+|---|---|---|---|
+| `safe_corridor` | 117.567 | 117.567 | 79.775 |
+| `risk_value_tradeoff` | 129.337 | 129.323 | 129.303 |
+| `shaping_trap` | 128.805 | 128.805 | 128.805 |
+
+Four bins cost nothing at the canonical start, and dropping battery *entirely* is what
+does not work: over every admissible start state, mean loss against `V*` is 1.90 / 0.83
+/ 0.17 for four bins against 5.84 / 7.66 / 1.01 with no battery axis at all. The
+curriculum trains from states the mission never reaches — stranded mid-map on low
+charge, where the right call is to abort for a nearer sample — and those are exactly
+the states that need the axis.
+
+These are **planning bounds, not learning results**: they say what a policy of each
+shape *could* achieve, not what tabular Q-learning finds. No claim about learned
+performance under either encoding belongs anywhere until a real experiment has been
+run under both.
+
+`--dense-battery` keeps the original encoding, and `ExperimentConfig.battery_encoding`
+carries it through a whole grid, because the binning is a claim and the dense run is
+the control it has to be measured against.
 
 **Every action is always legal.**
 Driving into a wall and collecting on an empty tile are legal actions that waste a step
@@ -293,10 +338,13 @@ redraws them for any saved run without retraining.
 
 **The per-battery value maps are a directory, not a page.** Battery is the axis the
 mission turns on and the one both summary figures marginalise away; the only honest way
-to keep it is one map per reading, so `figs/q_by_battery/` holds sixty-one frames on
-`safe_corridor` and a hundred and eighty-one on `shaping_trap`. They are zero-padded
-and named by battery so a viewer's arrow keys walk the drain in order, and
-`--no-battery-figs` opts out for callers redrawing figures in bulk.
+to keep it is one map per level of that axis, so `figs/q_by_battery/` holds four frames
+per scenario by default and sixty-one / seventy-one / a hundred and eighty-one under
+`--dense-battery`. They are zero-padded and named by *level index* rather than by
+battery reading, because the index is what stays sortable under either encoding; the
+range of readings a frame covers is on the frame itself, in its title and in a gauge
+that fills solid to the bin's floor and lighter to its ceiling. `--no-battery-figs`
+opts out for callers redrawing figures in bulk.
 
 **The battery frames share one colour scale, computed once across the whole table.**
 Per-frame normalisation would make each image internally legible and the set as a
@@ -323,6 +371,16 @@ a route, which is what an arrow gives and a letter does not, so the figures use
 **Cells with no update are hatched rather than tinted.** The diverging ramp's midpoint
 is nearly white, so a flat pale fill for "never updated" would sit one step away from a
 genuine value of zero. Texture is not a colour and cannot be read as one.
+
+**Figures read a saved table through the encoding of the run that wrote it.** The
+battery axis is a property of a run, not of the version drawing its figures, so
+`run_figures` takes a `BatteryBinning` and defaults it to *dense* rather than to the
+current training default: a run with nothing recorded about its encoding predates the
+flag, and every one of those is dense. The CLI reads
+`manifest["config"]["battery_encoding"]` and passes it to `figures`, `evaluate` and
+`replay`; `evaluate` additionally refuses a table whose row count disagrees with the
+scenario under the requested encoding, so a mismatch is an error rather than a silently
+misfiled score.
 
 **Both coverage denominators are reported.** A third of `safe_corridor`'s grid is
 wall, so coverage against every encodable state understates what a run covered by
@@ -423,3 +481,135 @@ it saved nothing -- it is now assigned from `pytest --durations`. Default `pytes
 The second clause is load-bearing: a command-line `-m` replaces `addopts` rather than
 combining with it, so `-m "not slow"` alone re-enables the teaching suite.
 
+
+**The reachable ceiling is per payload, not one traversable-cell count reused four
+times.** `coverage_report` used to compute `traversable_cells * battery_levels` once and
+hand the same number to all four payload slices. That is a statement about geometry and
+the coverage figure reads it as a statement about physics: carrying a sample means
+having already paid for the trip out to it, so the charge still aboard is capped by that
+sample's distance from the lander. On `safe_corridor` the biosignature sits 16 energy
+out, so a rover holding it can never have more than 43 of 60 charge, and 27 of the 172
+states in that slice cannot exist -- which the figure was drawing as 27 states the run
+failed to reach, right on the payload the curriculum exists to reach. `run_figures.
+occupiable_state_mask` now applies the same three-part test `MarsRoverEnv._validated_start`
+applies to an injected start -- non-wall, battery arithmetic payable, not already
+terminal -- so the ceiling excludes impossible states, a flat battery, and a sample
+carried onto the lander (that is the delivery, entered and never acted from). The
+`safe_corridor__sparse__seed1` figure went from a biosignature slice reading 36.0% to
+144 of 145 occupiable states, and the whole table from 94.5% of 688 to 99.5% of 653.
+The direct bar labels now quote the against-reachable share; against-total was mostly a
+count of how much of the map is wall.
+
+
+## Hyper-parameter search (Optuna)
+
+**Optuna is a dependency, and it is not an RL framework.** Non-negotiable #1 bans
+Gymnasium, Stable-Baselines, RLlib and friends because they would hide the learning loop.
+Optuna hides nothing: it never sees the environment, the agent, a reward, or a Q-table.
+It proposes a dict of numbers and reads one float back, which is the same contract a
+hand-written random search would have, with a better sampler behind it. It is declared in
+the main dependency list rather than an extra because `cli tune` is not optional tooling.
+
+**The per-trial episode cap is what makes the question measurable.** "Which
+hyper-parameters learn fastest" has no answer if every trial trains to convergence: all
+the converging settings tie, and the search quietly becomes a search for final
+performance. The cap is set below convergence on purpose (6000 against roughly 4000 for
+a tuned agent on `safe_corridor`), so that settings separate on *when* they get there.
+The cost is that the cap is part of the objective's definition and a winner must name it.
+
+**Grants are all-or-nothing.** `EpisodeLedger.grant` returns a full trial's episodes or
+zero, never a partial remainder. `score_learning_curve` normalises every trial against
+the same cap precisely so scores are comparable; a trial run on a short grant would have
+a different x-axis from everything it is ranked against, so it would be worth less than
+the episodes it cost. The ledger spends what trials *ran*, not what they were granted, so
+a pruned trial returns the difference and the study funds more trials than
+`fundable_trials`.
+
+**Pruning reports the raw checkpoint return, not the trial's score.** A pruner compares
+trials at a fixed step, so it needs the quantity that is comparable at a fixed episode
+count; the score is a whole-curve summary and is computed once, at the end. This is also
+why pruning is decided on the *first seed only*: reporting a step-0 value once per seed
+would make one trial number carry three incomparable sequences.
+
+**The prune decision travels through `train`'s new `checkpoint_callback`.** Returning
+`False` stops the run where it stands. Checkpoints are measured on a seed space disjoint
+from training and on their own environment, so a callback cannot change what a run
+learns -- `test_not_stopping_leaves_the_run_identical_to_one_without_a_callback` asserts
+the tables are bit-identical. `TrainResult.episodes_completed` and `stopped_early` exist
+because the ledger has to charge what was run, and a stopped run does not append a final
+checkpoint: it broke out immediately after one, and a second measurement at the same
+episode index would be a duplicate point and a wasted evaluation.
+
+**Epsilon's floor is sampled as a fraction of its ceiling.** `EpsilonSchedule` requires
+`end <= start`. Sampling the two rates independently would put a triangular corner of the
+space out of bounds, and the sampler would keep proposing trials that raise instead of
+training. `epsilon_end_ratio` removes the invalid region entirely rather than rejecting
+draws from it.
+
+**The curriculum knobs are conditional, not always-sampled.** `window_fraction` means
+nothing to the growing window; `weight_exponent` means nothing to either open-loop
+schedule. Suggesting a parameter the run will ignore teaches TPE's model that the value
+was tried and changed nothing, which is how a dead dimension dilutes a search. For the
+same reason the no-curriculum arm is a categorical switch rather than a fraction that
+might land on zero -- a continuous draw essentially never does, so the arm would never be
+explored.
+
+**The objective takes its own interface, not `optuna.trial.Trial`.**
+`suggest_trial_params` is typed against the `ParameterSuggester` protocol: two suggestion
+methods and nothing else. A real `Trial` satisfies it, and the search space can be tested
+against a recorder that reports which parameters were asked for, on what ranges, and
+under which condition -- which is exactly what a search space *is*, and what a real trial
+would answer stochastically.
+
+**The reference return is a planning bound, and the ceiling is unreachable on purpose.**
+`best_affordable_return` is the most valuable sample whose lander round trip fits the
+battery: 160 on all three bundled maps, from shortest paths alone. Slip lowers the
+achievable mean and a discount below 1.0 can make a nearer sample optimal, so a score of
+1.0 cannot be attained. That is the right shape for a *scale*: it is fixed by geometry
+rather than by the best trial seen so far, so scores do not move as the study proceeds,
+and two maps whose payoffs differ fourfold produce comparable numbers.
+
+**Trials keep no Q-table; the winner is re-trained.** Hundreds of tables is gigabytes of
+artefacts nothing reads. The best trial's configuration is trained once more into
+`best_run/` and evaluated on the same `eval_episodes` ruler every other study uses, and
+those episodes are charged to the same ledger -- confirming a winner is part of the cost
+of the search, and leaving it off the books would make the stated bound untrue. The
+confirmation number, not the winning trial's score, is the one to quote: the score was
+measured on the data the winner was selected on.
+
+**The study is in-memory, with no SQLite storage.** A search is reproducible from its
+`sampler_seed`, and `study.json` plus `trials.csv` are the record. An Optuna storage file
+would be a second, divergent copy of the same run, and would also make the artefact tree
+depend on Optuna's schema version.
+
+**`study.json` separates two kinds of meaningless.** `learning_is_meaningful` is false
+when the agent's own functions are stubs -- the tables are garbage. `search_is_meaningful`
+is false when the *objective* is stubbed -- the tables are real and only the ranking over
+them is fiction. They are different failures with different banners, and a reader of an
+old artefact needs to be able to tell which one they are holding.
+
+**Underflow is excluded from the floating-point guard.** The entry points install
+`divide`, `over` and `invalid` as raising (`src/mars_rover_q/numerics.py`) because each
+one means a defect here and a `nan` in a Q-table is silent and unrecoverable. `under` is
+left at numpy's default of ignore: underflow is not an error but the mechanism the
+log-sum-exp identity depends on, and `np.seterr` applies to the whole process rather than
+to this package -- Optuna's TPE sampler scores candidates that way, so raising on
+underflow crashed the search at the first trial the sampler modelled.
+
+**The battery encoding is searchable, but off by default (`search_battery_encoding`).**
+It is not a knob on the learning rule but on the table the rule writes into, so a study
+that varied it between trials would be comparing two representations as well as two
+settings -- and every other study in `docs/experiment-plan.md` holds the representation
+fixed for exactly that reason. It is searchable at all because on these maps it moves the
+outcome further than any of the six continuous knobs, and the winning encoding depends on
+the map and on the curriculum it is paired with, so there is no single value to fix it to.
+When a trial suggests one it overrides `TuningConfig.battery_encoding`, and the
+confirmation run evaluates the winner through the encoding that winner trained under.
+
+**Curated README figures live in `docs/assets/`, not in `artifacts/`.** `artifacts/` is
+generated output and is gitignored, so a figure referenced from the README has to be
+copied somewhere tracked or the README is broken in a fresh clone. Keeping the copies
+under `docs/` rather than force-adding into `artifacts/` leaves the ignore rule intact
+and keeps the distinction clean: `artifacts/` is what a run produced, `docs/assets/` is
+the small hand-picked subset the write-up actually refers to. The four files there total
+436 KB.

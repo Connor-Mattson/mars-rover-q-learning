@@ -18,7 +18,7 @@ from numpy.typing import NDArray
 from .actions import ACTION_LABELS, Action
 from .rewards import REWARD_MODE_LABELS, RewardMode
 from .scenario import Scenario, Terrain
-from .state import SAMPLE_LABELS, RoverState, SampleType, StateEncoder
+from .state import SAMPLE_LABELS, BatteryEncoding, RoverState, SampleType, StateEncoder
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle guard for type checking only
     from .environment import MarsRoverEnv
@@ -72,7 +72,12 @@ class OverlayState:
     visible: bool = False
 
     def action_at(self, cell: tuple[int, int], battery: int, carried: SampleType) -> Action | None:
-        """Greedy action for ``cell`` in the current battery/payload slice."""
+        """Greedy action for ``cell`` in the current battery/payload slice.
+
+        ``battery`` is the rover's exact charge; the encoder maps it onto whichever
+        row the table actually holds, so under a coarse binning the overlay redraws
+        only when the rover crosses a bin edge.
+        """
         if not self.visible or self.policy is None or self.encoder is None:
             return None
         try:
@@ -477,15 +482,25 @@ def replay_trajectory(
     *,
     policy: NDArray[np.int64] | None = None,
     fps: float = 4.0,
+    battery_encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY,
 ) -> None:
-    """Replay a recorded episode with pause, single-step, and speed controls."""
+    """Replay a recorded episode with pause, single-step, and speed controls.
+
+    ``battery_encoding`` has to be the one ``policy`` was trained under: the overlay
+    looks its arrows up by row ID, and a row ID only means the same state under the
+    same encoding.
+    """
     import pygame
 
     from .environment import MarsRoverEnv
     from .rewards import make_reward_model
 
     renderer = MissionRenderer(scenario, mode="human", caption="Mars Sample Return - replay")
-    env = MarsRoverEnv(scenario, make_reward_model(trajectory.reward_mode, scenario, 0.99))
+    env = MarsRoverEnv(
+        scenario,
+        make_reward_model(trajectory.reward_mode, scenario, 0.99),
+        battery_encoding=battery_encoding,
+    )
     encoder = env.encoder
     renderer.set_policy(policy, encoder)
 

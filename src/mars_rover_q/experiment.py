@@ -35,8 +35,10 @@ from .metrics import (
     greedy_actions,
     mean_ci,
 )
+from .numerics import install_numeric_guard
 from .rewards import RewardMode
 from .scenario import Scenario, resolve_scenario
+from .state import BatteryEncoding
 from .training import TrainConfig, TrainResult, train
 
 MANIFEST_NAME = "manifest.json"
@@ -128,6 +130,12 @@ class ExperimentConfig:
     learning_rate: float = 0.2
     gamma: float = 0.99
     initial_q: float = 0.0
+    #: How finely the tables resolve remaining charge. The grid does not sweep this
+    #: -- an encoding change makes tables of different lengths, so an arm under one
+    #: encoding cannot share a colour bar or a paired difference with an arm under
+    #: another -- but a whole grid can be re-run under the dense encoding to compare
+    #: the two as experiments rather than as planning bounds.
+    battery_encoding: str = BatteryEncoding.AFFORDABILITY.value
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_fraction: float = 0.6
@@ -252,6 +260,7 @@ class ExperimentConfig:
             learning_rate=self.learning_rate,
             gamma=self.gamma,
             initial_q=self.initial_q,
+            battery_encoding=BatteryEncoding(self.battery_encoding),
             epsilon_start=self.epsilon_start,
             epsilon_end=self.epsilon_end,
             epsilon_decay_fraction=self.epsilon_decay_fraction,
@@ -584,6 +593,7 @@ def run_cell(
         seed=seed,
         gamma=config.gamma,
         potential_scale=config.potential_scale,
+        battery_encoding=train_config.battery_encoding,
     )
     run_dir = (
         output_root
@@ -719,7 +729,7 @@ def _run_one_cell(
     did. The artefacts are already on disk by the time this returns.
     """
     config, scenario_name, reward_mode, budget, curriculum, strategy, seed, output_root = task
-    np.seterr(all="raise")
+    install_numeric_guard()
     _result, _evaluation, row = run_cell(
         config,
         scenario_name,
@@ -894,6 +904,7 @@ def write_policy_gifs(
             seed=int(row["seed"]),
             gamma=config.gamma,
             potential_scale=config.potential_scale,
+            battery_encoding=BatteryEncoding(config.battery_encoding),
             capture_best=False,
             capture_typical=True,
         )

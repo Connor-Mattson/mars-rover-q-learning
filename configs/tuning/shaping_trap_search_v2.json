@@ -1,0 +1,18 @@
+{
+  "name": "hyperparameter_search_shaping_trap",
+  "scenario": "shaping_trap",
+  "reward_mode": "sparse",
+  "seeds": [1],
+  "trial_episode_cap": 150000,
+  "study_episode_budget": 3600000,
+  "checkpoints": 12,
+  "checkpoint_episodes": 30,
+  "eval_episodes": 500,
+  "sampler_seed": 0,
+  "startup_trials": 8,
+  "warmup_checkpoints": 4,
+  "pruner_startup_trials": 8,
+  "search_curriculum": true,
+  "search_battery_encoding": true,
+  "confirm_best": true
+}

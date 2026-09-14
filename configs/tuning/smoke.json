@@ -1,0 +1,15 @@
+{
+  "name": "hyperparameter_search_smoke",
+  "scenario": "safe_corridor",
+  "reward_mode": "sparse",
+  "seeds": [
+    1
+  ],
+  "trial_episode_cap": 400,
+  "study_episode_budget": 5000,
+  "checkpoints": 5,
+  "checkpoint_episodes": 5,
+  "eval_episodes": 20,
+  "confirm_best": true,
+  "max_trials": 8
+}

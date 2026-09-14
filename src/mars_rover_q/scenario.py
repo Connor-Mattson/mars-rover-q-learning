@@ -17,7 +17,7 @@ from typing import Any, Final
 import numpy as np
 from numpy.typing import NDArray
 
-from .state import COLLECTABLE_SAMPLES, SampleType
+from .state import COLLECTABLE_SAMPLES, BatteryBinning, BatteryEncoding, SampleType
 
 
 class Terrain(IntEnum):
@@ -242,6 +242,42 @@ class Scenario:
         """Lander -> sample -> lander energy-weighted cost."""
         spec = self.samples[sample_type]
         return self.distance(self.lander, spec.position) + self.distance(spec.position, self.lander)
+
+    def mission_costs(self) -> dict[SampleType, float]:
+        """Minimum battery to collect and deliver each sample, starting from the lander.
+
+        Lander -> sample -> lander on the energy-weighted shortest path, plus the
+        ``COLLECT`` charge. :data:`UNREACHABLE` for a sample no route reaches.
+        """
+        return {
+            sample: self.round_trip_cost(sample) + self.collect_energy_cost
+            for sample in COLLECTABLE_SAMPLES
+        }
+
+    def battery_binning(
+        self, encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY
+    ) -> BatteryBinning:
+        """The battery axis this scenario's Q-table uses.
+
+        ``dense`` is one row per reading. ``affordability`` bins at
+        :meth:`mission_costs` -- the exact battery at which each sample's mission
+        stops being payable -- which puts a bin boundary at every charge level where
+        the optimal action can change and none anywhere else. Between two adjacent
+        thresholds the affordable set is constant, and with it the decision the
+        rover faces; the readings in between differ only by a factor of ``gamma``
+        that the discount already accounts for.
+
+        On all three bundled scenarios the three samples give three distinct
+        thresholds and therefore four bins, which is the shape the default is named
+        for; a map whose samples cost the same, or one with an unreachable sample,
+        gets correspondingly fewer.
+        """
+        resolved = BatteryEncoding(encoding)
+        if resolved is BatteryEncoding.DENSE:
+            return BatteryBinning.dense(self.battery_capacity)
+        return BatteryBinning.from_thresholds(
+            self.battery_capacity, list(self.mission_costs().values())
+        )
 
     def heuristic_target_sample(self) -> SampleType:
         """The subgoal sample used by both shaping schemes.

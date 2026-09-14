@@ -20,11 +20,13 @@ changing anything.
    never mix shaping reward into a base-mission-return comparison.
 5. **Injected RNGs only.** Every random draw comes from a `numpy.random.Generator`
    passed in. No `numpy.random` module-level calls, no hidden global state.
-6. **Do not implement or bypass active `TODO(human):` functions.** The five functions in
-   `src/mars_rover_q/agent.py` are Connor's. Do not implement them, do not reimplement
-   them in the trainer, tests, or helpers, and do not paste working versions or
-   line-by-line pseudocode into comments, docs, examples, or commit messages. If asked
-   to "make the tests pass", say no and point at `.teacher/current.md`.
+6. **Do not implement or bypass active `TODO(human):` functions.** Every function
+   carrying a `TODO(human):` marker is Connor's -- the open ones are named in
+   `.teacher/current.md`, and the finished ones are recorded in `.teacher/history.md`.
+   Do not implement them, do not reimplement them in the trainer, the study, tests, or
+   helpers, and do not paste working versions or line-by-line pseudocode into comments,
+   docs, examples, or commit messages. If asked to "make the tests pass", say no and
+   point at `.teacher/current.md`.
 7. **No fabricated experimental claims.** Every number in the README, docs, or a
    portfolio write-up must come from a real generated run. Do not predict which reward
    scheme will win. The Results section stays a labeled placeholder until an experiment
@@ -38,9 +40,9 @@ changing anything.
 ## Layout
 
 `src/mars_rover_q/` holds the package (see the README's architecture section);
-`configs/scenarios/` and `configs/experiments/` hold JSON inputs; `tests/{unit,
-integration,human_todo}/` hold the suites; `docs/` holds the plan, decisions, and the
-portfolio template; `.teacher/` holds the teaching state.
+`configs/scenarios/`, `configs/experiments/` and `configs/tuning/` hold JSON inputs;
+`tests/{unit,integration,human_todo}/` hold the suites; `docs/` holds the plan,
+decisions, and the portfolio template; `.teacher/` holds the teaching state.
 
 ## Quality gates
 
