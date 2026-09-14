@@ -2,6 +2,53 @@
 
 ![The tuned safe_corridor policy delivering the biosignature](docs/assets/safe-corridor-tuned-policy.gif)
 
+## TL;DR
+
+Tabular Q-learning on a hand-written Mars sample-return MDP — up to 104,256 states × 5
+actions — where a start-state curriculum is what makes a sparse reward learnable.
+
+```bash
+# 1. install
+uv venv --python 3.12 && uv sync --extra dev
+
+# 2. train the policy in the GIF above  (400,000 episodes, ~4m45s on one core)
+python -m mars_rover_q.cli train --scenario safe_corridor --reward sparse --seed 1 \
+    --episodes 400000 --learning-rate 0.6114 --gamma 0.9821 --initial-q 96.81 \
+    --epsilon-start 0.627 --epsilon-end 0.00106 \
+    --dense-battery --curriculum-fraction 0.5175 \
+    --curriculum-strategy sliding --curriculum-window-fraction 0.0217 \
+    --eval-episodes 500 --no-battery-figs
+
+# 3. watch it fly, and look at what it learned
+RUN=artifacts/runs/safe_corridor__sparse__seed1
+python -m mars_rover_q.cli replay   --run $RUN --episode best --policy-overlay
+python -m mars_rover_q.cli figures  --run $RUN
+python -m mars_rover_q.cli evaluate --run $RUN --episodes 500
+```
+
+That run evaluates at **success 1.000, mean base return 160.000** over 500 greedy
+episodes, delivering the 160-point biosignature in 500 of 500 — the optimum for this map.
+
+`train` prints that summary when it finishes and writes the run directory itself;
+`replay` opens the recorded episode in Pygame with the greedy policy drawn over the map;
+`figures` writes the diagnostics into `$RUN/figs/`:
+
+| File | What it shows |
+|---|---|
+| `figs/state_coverage.png` | how much of the table holds a value the trainer actually wrote, split by what was in the sample bay |
+| `figs/experience_heatmaps.png` | Q-updates per cell, battery summed away, one panel per payload |
+| `figs/q_by_battery/battery_NN.png` | one frame per battery level, each cell painted by its best action's value, with an arrow only where that action is unique |
+
+`--no-battery-figs` above skips only the per-battery frames during training, since
+`--dense-battery` makes 61 of them; step 3's `figures` draws the full set in about 35
+seconds. Drop `--dense-battery` to train on the four-bin affordability axis
+instead (1,600 rows rather than 24,400), and set `--curriculum-fraction 0` to see what the
+same agent does with no curriculum at all.
+
+---
+
+## The mission
+
 A rover lands on Mars with a finite battery and three reachable samples worth 40, 90 and
 160 points. It can carry one. It has to bring it home. The mission is not *find the goal*
 — it is *choose which goal is affordable* — and under a sparse reward that is a hard
@@ -9,9 +56,8 @@ exploration problem: the only non-zero signal arrives after a long, specific, ri
 sequence of actions that a random walk essentially never completes.
 
 This repository solves it with **tabular Q-learning and a start-state curriculum**, on a
-hand-written MDP with no RL framework anywhere in the learning path. The tables are large
-for a tabular method — up to **104,256 states × 5 actions** — and the curriculum is what
-makes them learnable: instead of starting every episode at the lander, training anneals
+hand-written MDP with no RL framework anywhere in the learning path. The curriculum is what
+makes a table that size learnable: instead of starting every episode at the lander, training anneals
 over start states the rover could *physically have driven itself into*, widening from easy
 to hard while evaluation stays pinned to the canonical lander start.
 
