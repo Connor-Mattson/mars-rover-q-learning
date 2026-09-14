@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from mars_rover_q.experiment import load_run, read_training_csv, save_run, write
 from mars_rover_q.metrics import canonical_start_records, learned_state_mask
 from mars_rover_q.rewards import RewardMode
 from mars_rover_q.scenario import Scenario, resolve_scenario
+from mars_rover_q.state import BatteryEncoding
 from mars_rover_q.training import TrainConfig, split_rngs, train
 
 
@@ -49,12 +51,32 @@ def test_training_completes_and_records_every_episode(
     assert result.total_env_steps > 0
 
 
+@pytest.mark.parametrize("encoding", list(BatteryEncoding))
 def test_training_allocates_a_fresh_table_of_the_right_shape(
-    corridor: Scenario, quick_config: TrainConfig
+    corridor: Scenario, quick_config: TrainConfig, encoding: BatteryEncoding
 ) -> None:
-    result = train(corridor, quick_config, warn_on_stubs=False, stream=io.StringIO())
-    expected_states = corridor.rows * corridor.cols * (corridor.battery_capacity + 1) * 4
+    config = replace(quick_config, battery_encoding=encoding)
+    result = train(corridor, config, warn_on_stubs=False, stream=io.StringIO())
+    levels = corridor.battery_binning(encoding).levels
+    expected_states = corridor.rows * corridor.cols * levels * 4
     assert result.q_table.shape == (expected_states, 5)
+    assert result.metadata["num_states"] == expected_states
+    assert result.metadata["battery_encoding"] == str(encoding)
+
+
+def test_the_default_encoding_is_far_smaller_than_the_dense_one(corridor: Scenario) -> None:
+    """The point of the default: the battery axis stops dominating the row count."""
+    binned = corridor.battery_binning()
+    dense = corridor.battery_binning(BatteryEncoding.DENSE)
+
+    assert binned.levels == 4
+    assert dense.levels == corridor.battery_capacity + 1
+    assert [binned.label(level) for level in range(binned.levels)] == [
+        "0-8",
+        "9-12",
+        "13-32",
+        "33-60",
+    ]
 
 
 def test_training_calls_every_human_owned_function(
@@ -130,14 +152,23 @@ def test_evaluation_disables_exploration(
         return original(q_table, state, epsilon, rng, mask)
 
     monkeypatch.setattr(evaluation, "select_action", spy)
-    table = np.zeros((corridor.rows * corridor.cols * (corridor.battery_capacity + 1) * 4, 5))
+    table = np.zeros((corridor.rows * corridor.cols * corridor.battery_binning().levels * 4, 5))
     evaluate(table, corridor, RewardMode.SPARSE, episodes=2, seed=1)
     assert seen
     assert set(seen) == {0.0}
 
 
+def test_evaluation_rejects_a_table_from_a_different_battery_encoding(
+    corridor: Scenario,
+) -> None:
+    """A row ID only means the same state under the same encoding."""
+    dense_rows = corridor.rows * corridor.cols * (corridor.battery_capacity + 1) * 4
+    with pytest.raises(ValueError, match="different battery encoding"):
+        evaluate(np.zeros((dense_rows, 5)), corridor, RewardMode.SPARSE, episodes=1, seed=1)
+
+
 def test_evaluation_summarises_and_captures_a_best_trajectory(corridor: Scenario) -> None:
-    table = np.zeros((corridor.rows * corridor.cols * (corridor.battery_capacity + 1) * 4, 5))
+    table = np.zeros((corridor.rows * corridor.cols * corridor.battery_binning().levels * 4, 5))
     result = evaluate(table, corridor, RewardMode.SPARSE, episodes=3, seed=1)
     assert result.summary.episodes == 3
     assert result.best_trajectory is not None

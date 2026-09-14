@@ -20,7 +20,7 @@ from numpy.typing import NDArray
 from .actions import ACTION_DELTAS, DEFLECTIONS, NUM_ACTIONS, Action
 from .rewards import RewardModel
 from .scenario import OUTCOMES, Scenario
-from .state import RoverState, SampleType, StateEncoder
+from .state import BatteryEncoding, RoverState, SampleType, StateEncoder
 
 
 class Outcome(StrEnum):
@@ -95,6 +95,10 @@ class MarsRoverEnv:
     * All randomness comes from an injected :class:`numpy.random.Generator`.
     * Energy is charged for the tile the rover *occupies after* the transition,
       so a slip, a wall collision, and an invalid ``COLLECT`` all still cost power.
+    * ``battery_encoding`` sets how coarsely :attr:`observation` resolves the
+      battery. It changes the *table*, never the dynamics: the rover's charge is an
+      exact integer in every state, transition, and ``info`` payload either way, and
+      two runs under different encodings meet an identical environment.
     """
 
     metadata: Final[dict[str, Any]] = {"render_modes": [None, "human", "rgb_array"]}
@@ -107,6 +111,7 @@ class MarsRoverEnv:
         render_mode: str | None = None,
         max_steps: int | None = None,
         rng: np.random.Generator | None = None,
+        battery_encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY,
     ) -> None:
         if render_mode not in self.metadata["render_modes"]:
             raise ValueError(f"render_mode {render_mode!r} not in {self.metadata['render_modes']}")
@@ -116,7 +121,13 @@ class MarsRoverEnv:
         self.max_steps = int(max_steps) if max_steps is not None else scenario.max_steps
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {self.max_steps}")
-        self.encoder = StateEncoder(scenario.rows, scenario.cols, scenario.battery_capacity)
+        self.battery_encoding = BatteryEncoding(battery_encoding)
+        self.encoder = StateEncoder(
+            scenario.rows,
+            scenario.cols,
+            scenario.battery_capacity,
+            scenario.battery_binning(self.battery_encoding),
+        )
         self.rng: np.random.Generator = rng if rng is not None else np.random.default_rng()
 
         self._probability_table: dict[int, NDArray[np.float64]] = {
@@ -133,7 +144,7 @@ class MarsRoverEnv:
 
     @property
     def num_states(self) -> int:
-        """Number of Q-table rows for this scenario."""
+        """Number of Q-table rows for this scenario and battery encoding."""
         return self.encoder.num_states
 
     @property

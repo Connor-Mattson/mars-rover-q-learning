@@ -1,0 +1,17 @@
+{
+  "name": "hyperparameter_search_safe_corridor",
+  "scenario": "safe_corridor",
+  "reward_mode": "sparse",
+  "seeds": [1, 2],
+  "trial_episode_cap": 20000,
+  "study_episode_budget": 5000000,
+  "checkpoints": 12,
+  "checkpoint_episodes": 30,
+  "eval_episodes": 300,
+  "sampler_seed": 0,
+  "startup_trials": 10,
+  "warmup_checkpoints": 3,
+  "pruner_startup_trials": 5,
+  "search_curriculum": true,
+  "confirm_best": true
+}

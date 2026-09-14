@@ -21,13 +21,14 @@ from mars_rover_q.curriculum import (
     curriculum_stub_status,
     growing_window_bounds,
     rank_band_shares,
+    sample_exploring_start_state,
     sample_sliding_window_start_state,
     simulate_start_distribution,
     sliding_window_bounds,
     start_state_difficulty,
 )
 from mars_rover_q.scenario import Scenario
-from mars_rover_q.state import RoverState, SampleType, StateEncoder
+from mars_rover_q.state import BatteryEncoding, RoverState, SampleType, StateEncoder
 
 POOL = [RoverState(1, 1, rank + 1, SampleType.BASALT) for rank in range(20)]
 CANONICAL = RoverState(3, 3, 20, SampleType.NONE)
@@ -203,7 +204,13 @@ def test_only_the_visit_weighted_strategy_reads_the_table(tiny_scenario: Scenari
 
 
 def test_pool_update_counts_gathers_in_pool_order(tiny_scenario: Scenario) -> None:
-    curriculum = StartStateCurriculum(tiny_scenario, total_episodes=100, anneal_fraction=0.5)
+    """Under the dense encoding a pool entry owns a table row outright."""
+    curriculum = StartStateCurriculum(
+        tiny_scenario,
+        total_episodes=100,
+        anneal_fraction=0.5,
+        battery_encoding=BatteryEncoding.DENSE,
+    )
     encoder = StateEncoder(tiny_scenario.rows, tiny_scenario.cols, tiny_scenario.battery_capacity)
     visits = np.zeros(encoder.num_states, dtype=np.int64)
     visits[encoder.encode(curriculum.ranked_pool[3])] = 7
@@ -211,6 +218,33 @@ def test_pool_update_counts_gathers_in_pool_order(tiny_scenario: Scenario) -> No
     assert gathered.shape == (len(curriculum.ranked_pool),)
     assert gathered[3] == 7
     assert gathered.sum() == 7
+
+
+def test_pool_update_counts_are_shared_by_everything_in_a_battery_bin(
+    tiny_scenario: Scenario,
+) -> None:
+    """The visit tilt chases under-updated *rows*, and a binned row has many owners.
+
+    This is the honest reading rather than a defect: the pool still holds exact
+    battery readings, but several of them update one row, so all of them see that
+    row's experience.
+    """
+    curriculum = StartStateCurriculum(tiny_scenario, total_episodes=100, anneal_fraction=0.5)
+    encoder = StateEncoder(
+        tiny_scenario.rows,
+        tiny_scenario.cols,
+        tiny_scenario.battery_capacity,
+        tiny_scenario.battery_binning(),
+    )
+    row = encoder.encode(curriculum.ranked_pool[3])
+    visits = np.zeros(encoder.num_states, dtype=np.int64)
+    visits[row] = 7
+    gathered = curriculum.pool_update_counts(visits)
+    sharers = sum(1 for state in curriculum.ranked_pool if encoder.encode(state) == row)
+
+    assert sharers > 1
+    assert gathered[3] == 7
+    assert gathered.sum() == 7 * sharers
 
 
 def test_pool_update_counts_of_nothing_is_zeros(tiny_scenario: Scenario) -> None:
@@ -240,16 +274,29 @@ def test_a_disabled_curriculum_ignores_its_strategy(tiny_scenario: Scenario) -> 
 # -- the dry-run diagnostic ------------------------------------------------
 
 
-def test_the_simulation_records_one_draw_per_episode(tiny_scenario: Scenario) -> None:
+@pytest.mark.parametrize("encoding", list(BatteryEncoding))
+def test_the_simulation_records_one_draw_per_episode(
+    tiny_scenario: Scenario, encoding: BatteryEncoding
+) -> None:
     curriculum = StartStateCurriculum(
-        tiny_scenario, total_episodes=200, anneal_fraction=0.5, strategy="sliding"
+        tiny_scenario,
+        total_episodes=200,
+        anneal_fraction=0.5,
+        strategy="sliding",
+        battery_encoding=encoding,
     )
     anneal = simulate_start_distribution(curriculum, np.random.default_rng(6), episodes=120)
     assert anneal.ranks.shape == anneal.difficulties.shape == (120,)
     assert anneal.is_canonical.shape == (120,)
     assert (anneal.ranks < anneal.pool_size).all()
-    # Every drawn state is pooled, so the synthetic counter accounts for every episode.
-    assert anneal.update_counts.sum() == 120
+    # Every drawn state is pooled, so every episode is attributed to its own rank.
+    # The gathered total is exactly 120 only when a rank owns its row, which is the
+    # dense encoding; a binned row is shared, and every sharer reports it.
+    drawn = np.bincount(anneal.ranks, minlength=anneal.pool_size)
+    assert (anneal.update_counts[drawn > 0] > 0).all()
+    assert anneal.update_counts.sum() >= 120
+    if encoding is BatteryEncoding.DENSE:
+        assert anneal.update_counts.sum() == 120
 
 
 def test_the_simulation_runs_the_anneal_by_default(tiny_scenario: Scenario) -> None:
@@ -318,6 +365,86 @@ def test_band_count_is_validated() -> None:
         rank_band_shares([1], 10, bands=0)
 
 
+# -- exploring starts ------------------------------------------------------
+
+
+def test_exploring_starts_cover_the_whole_pool_from_the_very_first_episode() -> None:
+    """The distinguishing property: no easy end, no widening, no schedule."""
+    rng = np.random.default_rng(0)
+    drawn = {sample_exploring_start_state(POOL, CANONICAL, 0.0, rng) for _ in range(500)}
+    assert drawn == set(POOL)
+
+
+def test_exploring_starts_ignore_progress() -> None:
+    """Every other strategy moves its support; this one must not.
+
+    Same seed, different progress: an identical draw sequence is the strongest
+    statement that ``progress`` is not consulted below the terminal guard.
+    """
+    sequences = [
+        [
+            sample_exploring_start_state(POOL, CANONICAL, progress, np.random.default_rng(7))
+            for _ in range(1)
+        ]
+        for progress in (0.0, 0.3, 0.9)
+    ]
+    assert sequences[0] == sequences[1] == sequences[2]
+
+
+def test_exploring_starts_draw_the_pool_uniformly() -> None:
+    rng = np.random.default_rng(3)
+    counts = dict.fromkeys(POOL, 0)
+    draws = 20_000
+    for _ in range(draws):
+        counts[sample_exploring_start_state(POOL, CANONICAL, 0.5, rng)] += 1
+    expected = draws / len(POOL)
+    assert max(abs(count - expected) for count in counts.values()) < 0.25 * expected
+
+
+def test_exploring_starts_end_on_the_canonical_distribution() -> None:
+    rng = np.random.default_rng(1)
+    assert sample_exploring_start_state(POOL, CANONICAL, 1.0, rng) == CANONICAL
+
+
+def test_exploring_starts_degrade_to_canonical_on_an_empty_pool() -> None:
+    rng = np.random.default_rng(1)
+    assert sample_exploring_start_state([], CANONICAL, 0.5, rng) == CANONICAL
+
+
+@pytest.mark.parametrize("progress", [-0.1, 1.5])
+def test_exploring_starts_validate_progress(progress: float) -> None:
+    with pytest.raises(ValueError):
+        sample_exploring_start_state(POOL, CANONICAL, progress, np.random.default_rng(1))
+
+
+def test_exploring_starts_do_not_disturb_the_pool() -> None:
+    before = list(POOL)
+    rng = np.random.default_rng(5)
+    for _ in range(100):
+        sample_exploring_start_state(POOL, CANONICAL, 0.4, rng)
+    assert before == POOL
+
+
+def test_the_curriculum_dispatches_to_the_exploring_sampler(tiny_scenario: Scenario) -> None:
+    """Wiring, plus the property that separates this arm from the growing window.
+
+    At ``progress == 0.0`` the growing window is confined to the easiest quarter of
+    the pool by its own invariant. Exploring starts must reach the hardest quarter
+    on the very first episode, so a draw that lands there is the assertion that the
+    dispatch arrived somewhere other than :func:`sample_start_state`.
+    """
+    curriculum = StartStateCurriculum(
+        tiny_scenario, total_episodes=100, anneal_fraction=1.0, strategy="exploring"
+    )
+    pool = curriculum.ranked_pool
+    rng = np.random.default_rng(0)
+    ranks = [pool.index(curriculum.start_state_for(0, rng)) for _ in range(400)]
+    assert set(pool).issuperset(curriculum.start_state_for(0, rng) for _ in range(50))
+    assert max(ranks) >= 0.75 * len(pool)
+    assert min(ranks) < 0.25 * len(pool)
+    assert not curriculum.needs_update_counts
+
+
 # -- arm vocabulary --------------------------------------------------------
 
 
@@ -334,6 +461,7 @@ def test_each_strategy_names_its_own_arm() -> None:
         "Growing Window Curriculum",
         "Sliding Window Curriculum",
         "Visit-Weighted Curriculum",
+        "Exploring Starts Curriculum",
     }
     assert curriculum_arm_slug(0.5, "sliding") == "sliding-window-curriculum"
 

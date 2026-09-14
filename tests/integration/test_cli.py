@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from mars_rover_q.cli import build_parser, main
 from mars_rover_q.scenario import resolve_scenario
+from mars_rover_q.state import NUM_PAYLOAD_STATES
 
 
 @pytest.mark.parametrize(
@@ -16,6 +18,8 @@ from mars_rover_q.scenario import resolve_scenario
     [
         ["play", "--scenario", "safe_corridor"],
         ["train", "--scenario", "safe_corridor", "--reward", "sparse", "--seed", "1"],
+        ["train", "--scenario", "safe_corridor", "--dense-battery"],
+        ["play", "--scenario", "safe_corridor", "--dense-battery"],
         ["evaluate", "--run", "some/run", "--episodes", "500"],
         ["experiment", "--config", "configs/experiments/reward_comparison.json"],
         ["replay", "--run", "some/run", "--episode", "best"],
@@ -268,7 +272,6 @@ def test_train_writes_the_per_run_figures(
     assert "figure written to" in capsys.readouterr().out
 
 
-@pytest.mark.slow
 def test_train_writes_a_battery_frame_per_battery_level(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -277,12 +280,72 @@ def test_train_writes_a_battery_frame_per_battery_level(
 
     frames = sorted((run_dir / "figs" / "q_by_battery").iterdir())
     scenario = resolve_scenario("safe_corridor")
-    assert len(frames) == scenario.battery_capacity + 1
-    # Counted, not listed: sixty-one paths differing in two characters would bury
-    # the run summary they are printed beside.
+    assert len(frames) == scenario.battery_binning().levels == 4
     output = capsys.readouterr().out
     assert f"{len(frames)} battery frames written to" in output
     assert frames[0].name not in output
+
+
+@pytest.mark.slow
+def test_dense_battery_writes_a_frame_per_reading(tmp_path: Path) -> None:
+    """``--dense-battery`` is the sixty-one-frame set the drain sequence was built on."""
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--dense-battery")) == 0
+
+    frames = sorted((run_dir / "figs" / "q_by_battery").iterdir())
+    scenario = resolve_scenario("safe_corridor")
+    assert len(frames) == scenario.battery_capacity + 1
+    assert frames[0].name == "battery_00.png"
+    assert frames[-1].name == f"battery_{scenario.battery_capacity}.png"
+
+
+def test_train_defaults_to_the_binned_battery_axis(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs")) == 0
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    scenario = resolve_scenario("safe_corridor")
+    rows = scenario.rows * scenario.cols * 4 * NUM_PAYLOAD_STATES
+
+    assert manifest["config"]["battery_encoding"] == "affordability"
+    assert manifest["num_states"] == rows
+    assert np.load(run_dir / "q_table.npy").shape == (rows, 5)
+
+
+def test_dense_battery_restores_the_original_row_count(tmp_path: Path) -> None:
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs", "--dense-battery")) == 0
+
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    scenario = resolve_scenario("safe_corridor")
+    rows = scenario.rows * scenario.cols * (scenario.battery_capacity + 1) * NUM_PAYLOAD_STATES
+
+    assert manifest["config"]["battery_encoding"] == "dense"
+    assert manifest["num_states"] == rows
+    assert np.load(run_dir / "q_table.npy").shape == (rows, 5)
+
+
+def test_evaluate_and_figures_follow_the_run_s_own_encoding(tmp_path: Path) -> None:
+    """A saved table has to be read back through the axis it was written under."""
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs", "--dense-battery")) == 0
+
+    assert main(["evaluate", "--run", str(run_dir), "--episodes", "2"]) == 0
+    assert main(["figures", "--run", str(run_dir), "--no-battery-figs"]) == 0
+    assert (run_dir / "figs" / "state_coverage.png").exists()
+
+
+def test_a_run_saved_before_the_flag_existed_is_read_as_dense(tmp_path: Path) -> None:
+    """Every run written before the encoding was configurable is a dense one."""
+    run_dir = tmp_path / "run"
+    assert main(_train_args(run_dir, "--no-figs", "--dense-battery")) == 0
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    del manifest["config"]["battery_encoding"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert main(["evaluate", "--run", str(run_dir), "--episodes", "2"]) == 0
+    assert main(["figures", "--run", str(run_dir), "--no-battery-figs"]) == 0
 
 
 def test_train_can_skip_only_the_battery_frames(tmp_path: Path) -> None:

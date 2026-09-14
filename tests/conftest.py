@@ -67,3 +67,23 @@ def tiny_env(tiny_scenario: Scenario) -> MarsRoverEnv:
 def bundled_scenario(request: pytest.FixtureRequest) -> Scenario:
     """Each bundled scenario in turn."""
     return resolve_scenario(str(request.param))
+
+
+@pytest.fixture
+def stubbed_tuning_objective(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the search into its teaching state, whatever state the repository is in.
+
+    The stub banner, ``search_is_meaningful`` and ``pending_human_functions`` are
+    machinery that has to keep working after an assignment closes, so the tests for
+    them install the placeholder behaviour rather than relying on the real functions
+    still being stubs. Both are looked up as module globals at every call site, so
+    patching them here covers the probe, ``run_trial``, ``run_study`` and the CLI.
+    """
+    from mars_rover_q import tuning
+
+    monkeypatch.setattr(
+        tuning,
+        "score_learning_curve",
+        lambda *_args, **_kwargs: tuning.SCORE_WHEN_STUBBED,
+    )
+    monkeypatch.setattr(tuning, "pareto_front", lambda *_args, **_kwargs: [])

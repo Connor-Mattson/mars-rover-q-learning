@@ -23,6 +23,7 @@ from .experiment import CHECKPOINT_CSV, read_checkpoint_csv, read_training_csv
 from .metrics import canonical_start_records, mean_ci, rolling_success_rate
 from .rewards import RewardMode
 from .sweep import BASELINE_CURRICULUM, BudgetSeries, arm_of_row, budget_curve_series
+from .tuning import TrialOutcome
 
 NDArray_f = NDArray[np.float64]
 
@@ -74,6 +75,7 @@ CURRICULUM_STRATEGY_COLOURS: dict[str, str] = {
     CurriculumStrategy.GROWING.value: CURRICULUM_TREATMENT_COLOUR,
     CurriculumStrategy.SLIDING.value: "#2f8f83",
     CurriculumStrategy.VISIT_WEIGHTED.value: "#b5476b",
+    CurriculumStrategy.EXPLORING.value: "#b39016",
 }
 #: Recessive ink for the zero rule and the target line: reference geometry, not data.
 REFERENCE_INK = "#8a8a86"
@@ -494,6 +496,169 @@ def paired_difference_curves(output_path: Path, analysis: dict[str, Any]) -> Pat
     return output_path
 
 
+TUNING_SCORE_COLOUR = "#3a6ea5"
+TUNING_PRUNED_COLOUR = "#b0aca4"
+TUNING_FRONT_COLOUR = "#c9762e"
+
+
+def search_progress(output_path: Path, outcomes: Sequence[TrialOutcome]) -> Path:
+    """Score against trial number, with the running best and the pruned trials marked.
+
+    Two things are readable here and nowhere else. The running best is the search's own
+    learning curve: a line that flattens early says the sampler found its optimum and
+    the remaining budget bought refinement rather than discovery. The pruned trials sit
+    on their own rule at the bottom -- they have no score, and drawing them at zero
+    would put them among the genuinely worthless settings instead of among the
+    unmeasured ones.
+    """
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    scored = [o for o in outcomes if o.score is not None]
+    pruned = [o for o in outcomes if o.score is None]
+
+    if scored:
+        numbers = np.array([o.number for o in scored], dtype=np.float64)
+        scores = np.array([float(o.score or 0.0) for o in scored], dtype=np.float64)
+        ax.scatter(numbers, scores, s=26, color=TUNING_SCORE_COLOUR, alpha=0.75, label="trial")
+        ax.plot(
+            numbers,
+            np.maximum.accumulate(scores),
+            color=TUNING_FRONT_COLOUR,
+            linewidth=2.0,
+            label="best so far",
+        )
+    if pruned:
+        floor = 0.0 if not scored else float(min(o.score or 0.0 for o in scored))
+        ax.scatter(
+            [o.number for o in pruned],
+            np.full(len(pruned), floor),
+            s=18,
+            marker="x",
+            color=TUNING_PRUNED_COLOUR,
+            label=f"pruned ({len(pruned)})",
+        )
+    ax.set_xlabel("trial")
+    ax.set_ylabel("objective score")
+    ax.set_title("Search progress", fontsize=11)
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def pareto_scatter(
+    output_path: Path,
+    outcomes: Sequence[TrialOutcome],
+    front: Sequence[TrialOutcome],
+) -> Path:
+    """Episodes-to-best against best return, with the non-dominated set joined.
+
+    This is the figure the scalar score cannot be: it shows the trade-off the objective
+    resolved rather than its verdict. The staircase is drawn with ``post`` steps because
+    the front is a frontier, not an interpolation -- nothing was measured between two
+    adjacent front trials, and a straight line between them would assert otherwise.
+    """
+    fig, ax = plt.subplots(figsize=(6.4, 4.4))
+    if outcomes:
+        ax.scatter(
+            [o.episodes_to_best for o in outcomes],
+            [o.best_return for o in outcomes],
+            s=26,
+            color=TUNING_SCORE_COLOUR,
+            alpha=0.55,
+            label="trial",
+        )
+    ordered = sorted(front, key=lambda o: (o.episodes_to_best, -o.best_return))
+    if ordered:
+        ax.step(
+            [o.episodes_to_best for o in ordered],
+            [o.best_return for o in ordered],
+            where="post",
+            color=TUNING_FRONT_COLOUR,
+            linewidth=2.0,
+            marker="o",
+            ms=6,
+            label=f"Pareto front ({len(ordered)})",
+        )
+    else:
+        ax.annotate(
+            "no front available",
+            (0.5, 0.5),
+            xycoords="axes fraction",
+            ha="center",
+            fontsize=9,
+            color=REFERENCE_INK,
+        )
+    ax.set_xlabel("episodes to best return")
+    ax.set_ylabel("best mean BASE return (no shaping)")
+    ax.set_title("Cost of performance across trials", fontsize=11)
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def tuning_curves(output_path: Path, outcomes: Sequence[TrialOutcome], top: int = 5) -> Path:
+    """Checkpoint curves of the best-scoring trials, against every other trial faintly.
+
+    The objective reads a whole curve, so the ranking it produces is only interpretable
+    against the curves themselves: two trials can share a final return and differ
+    entirely in when they got there, which is the whole point of the search.
+    """
+    fig, ax = plt.subplots(figsize=(7.2, 4.4))
+    scored = sorted(
+        (o for o in outcomes if o.score is not None),
+        key=lambda o: (-(o.score or 0.0), o.number),
+    )
+    for outcome in outcomes:
+        if outcome.curve:
+            x, y = zip(*outcome.curve, strict=True)
+            ax.plot(x, y, color=TUNING_PRUNED_COLOUR, linewidth=0.7, alpha=0.45, zorder=1)
+    colours = plt.get_cmap("viridis")(np.linspace(0.1, 0.85, max(1, min(top, len(scored)))))
+    for colour, outcome in zip(colours, scored[:top], strict=False):
+        if not outcome.curve:
+            continue
+        x, y = zip(*outcome.curve, strict=True)
+        ax.plot(
+            x,
+            y,
+            color=colour,
+            linewidth=2.0,
+            marker="o",
+            ms=3.5,
+            zorder=3,
+            label=f"#{outcome.number} score={outcome.score:0.3f}",
+        )
+    ax.set_xlabel("training episodes")
+    ax.set_ylabel("mean BASE return (no shaping)")
+    ax.set_title(f"Top {min(top, len(scored))} trials by objective score", fontsize=11)
+    ax.grid(alpha=0.25)
+    if scored:
+        ax.legend(fontsize=8, loc="best", framealpha=0.9)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+    return output_path
+
+
+def write_tuning_plots(
+    output_root: Path,
+    outcomes: Sequence[TrialOutcome],
+    front: Sequence[TrialOutcome],
+) -> list[Path]:
+    """Write every hyper-parameter-search figure into ``output_root/plots``."""
+    plots_dir = output_root / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    return [
+        search_progress(plots_dir / "search_progress.png", outcomes),
+        pareto_scatter(plots_dir / "pareto_front.png", outcomes, front),
+        tuning_curves(plots_dir / "top_trial_curves.png", outcomes),
+    ]
+
+
 def write_experiment_plots(
     output_root: Path,
     rows: Sequence[dict[str, Any]],
@@ -538,10 +703,17 @@ __all__ = [
     "CURRICULUM_STRATEGY_COLOURS",
     "CURRICULUM_TREATMENT_COLOUR",
     "REWARD_COLOURS",
+    "TUNING_FRONT_COLOUR",
+    "TUNING_PRUNED_COLOUR",
+    "TUNING_SCORE_COLOUR",
     "budget_curves",
     "comparison_bars",
     "failure_modes",
     "learning_curves",
     "paired_difference_curves",
+    "pareto_scatter",
+    "search_progress",
+    "tuning_curves",
     "write_experiment_plots",
+    "write_tuning_plots",
 ]

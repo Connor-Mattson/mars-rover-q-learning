@@ -20,6 +20,7 @@ from .environment import Outcome
 from .metrics import EpisodeRecord, EpisodeSummary, summarize_episodes
 from .rewards import RewardMode
 from .scenario import Scenario
+from .state import BatteryEncoding
 from .training import make_env, split_rngs
 
 #: Offset applied to a training seed so evaluation never reuses its stream.
@@ -80,6 +81,7 @@ def evaluate(
     gamma: float = 0.99,
     potential_scale: float = 1.0,
     max_steps: int | None = None,
+    battery_encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY,
     capture_best: bool = True,
     capture_typical: bool = False,
 ) -> EvaluationResult:
@@ -87,6 +89,11 @@ def evaluate(
 
     Exploration is off (``epsilon = 0``); the environment keeps its stochastic
     wheel slip, so the success rate reflects real mobility risk.
+
+    ``battery_encoding`` must match the one ``q_table`` was trained under -- it is
+    what makes a row ID mean the same state here as it did in training. A mismatch
+    is caught as a shape error rather than silently scoring the wrong rows: the two
+    encodings give tables of different lengths.
     """
     if episodes <= 0:
         raise ValueError(f"episodes must be positive, got {episodes}")
@@ -98,7 +105,15 @@ def evaluate(
         rng=env_rng,
         potential_scale=potential_scale,
         max_steps=max_steps,
+        battery_encoding=battery_encoding,
     )
+    if len(q_table) != env.num_states:
+        env.close()
+        raise ValueError(
+            f"q_table has {len(q_table)} rows but {scenario.name} under battery_encoding="
+            f"{env.battery_encoding} has {env.num_states} states; the table was "
+            "trained under a different battery encoding"
+        )
 
     records: list[EpisodeRecord] = []
     best: Trajectory | None = None

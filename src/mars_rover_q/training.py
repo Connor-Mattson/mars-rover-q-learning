@@ -9,6 +9,7 @@ prints a conspicuous teaching-state warning saying so.
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -42,7 +43,7 @@ from .metrics import (
 )
 from .rewards import RewardMode, make_reward_model
 from .scenario import Scenario
-from .state import RoverState
+from .state import BatteryEncoding, RoverState
 
 TEACHING_WARNING = """
 ================================ TEACHING STATE ================================
@@ -92,6 +93,11 @@ class TrainConfig:
     from the ranked pool, and ``curriculum_window_fraction`` and
     ``curriculum_weight_exponent`` are that strategy's knobs. See
     :mod:`mars_rover_q.curriculum`.
+
+    ``battery_encoding`` picks how finely the table resolves remaining charge. It is
+    a representation choice, not an environment one -- the MDP is identical either
+    way -- but it changes the table's row count by more than an order of magnitude,
+    so it is recorded here and lands in the run manifest alongside the seed.
     """
 
     scenario: str
@@ -101,6 +107,7 @@ class TrainConfig:
     learning_rate: float = 0.2
     gamma: float = 0.99
     initial_q: float = 0.0
+    battery_encoding: BatteryEncoding = BatteryEncoding.AFFORDABILITY
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay_fraction: float = 0.6
@@ -140,6 +147,7 @@ class TrainConfig:
         payload = asdict(self)
         payload["reward_mode"] = str(self.reward_mode)
         payload["curriculum_strategy"] = str(self.curriculum_strategy)
+        payload["battery_encoding"] = str(self.battery_encoding)
         return payload
 
 
@@ -168,6 +176,14 @@ class TrainResult:
     #: recoverable from the table afterwards: a state visited ten thousand times and
     #: a state visited once are both simply "not the initial value".
     visit_counts: NDArray[np.int64] = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+    #: Episodes actually run. This is ``config.episodes`` unless a
+    #: ``checkpoint_callback`` asked :func:`train` to stop early, which is how the
+    #: hyper-parameter search abandons a hopeless trial: the episodes it did not
+    #: run are the ones the study gets to spend somewhere else, so the true count
+    #: has to be reported rather than assumed from the config.
+    episodes_completed: int = 0
+    #: Whether a ``checkpoint_callback`` ended the run before its episode budget.
+    stopped_early: bool = False
 
     @property
     def learning_is_meaningful(self) -> bool:
@@ -190,6 +206,7 @@ def make_env(
     potential_scale: float = 1.0,
     max_steps: int | None = None,
     render_mode: str | None = None,
+    battery_encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY,
 ) -> MarsRoverEnv:
     """Build an environment with the reward model for one experimental condition."""
     reward_model = make_reward_model(reward_mode, scenario, gamma, potential_scale=potential_scale)
@@ -199,6 +216,7 @@ def make_env(
         render_mode=render_mode,
         max_steps=max_steps,
         rng=rng,
+        battery_encoding=battery_encoding,
     )
 
 
@@ -236,6 +254,7 @@ def train(
     progress: bool = False,
     warn_on_stubs: bool = True,
     stream: Any = None,
+    checkpoint_callback: Callable[[CheckpointRecord], bool] | None = None,
 ) -> TrainResult:
     """Run tabular Q-learning for ``config.episodes`` episodes.
 
@@ -247,10 +266,19 @@ def train(
         warn_on_stubs: print the teaching-state banner when the human-owned
             functions are still placeholders.
         stream: where warnings and progress go; defaults to ``sys.stderr``.
+        checkpoint_callback: called with each mid-training checkpoint as it is
+            measured. Returning ``False`` stops training there, which is what lets
+            the hyper-parameter search abandon a trial whose curve is already
+            hopeless and spend the unused episodes on another one. It cannot change
+            what the run learns -- checkpoints are measured on a disjoint seed space
+            and on their own environment -- so a run that is never stopped is
+            bit-identical with and without a callback.
 
     Returns:
         A :class:`TrainResult`. Its ``learning_is_meaningful`` flag is ``False``
-        while any human-owned function is a stub.
+        while any human-owned function is a stub, and ``episodes_completed`` is the
+        episode count actually run, which is lower than ``config.episodes`` when the
+        callback stopped the run.
     """
     out = stream if stream is not None else sys.stderr
     pending = teaching_stub_status()
@@ -266,6 +294,7 @@ def train(
         strategy=config.curriculum_strategy,
         window_fraction=config.curriculum_window_fraction,
         weight_exponent=config.curriculum_weight_exponent,
+        battery_encoding=config.battery_encoding,
     )
     if curriculum.enabled and not curriculum.active and warn_on_stubs:
         print(CURRICULUM_WARNING.format(fraction=config.curriculum_fraction), file=out)
@@ -287,6 +316,7 @@ def train(
         rng=env_rng,
         potential_scale=config.potential_scale,
         max_steps=config.max_steps,
+        battery_encoding=config.battery_encoding,
     )
 
     q_table = initialize_q_table(
@@ -302,6 +332,8 @@ def train(
     start_states: set[RoverState] = set()
     schedule = set(checkpoint_schedule(config.episodes, config.eval_checkpoints))
     checkpoint_index = 0
+    episodes_completed = 0
+    stopped_early = False
 
     for episode in range(config.episodes):
         # Measured *before* the episode runs, so checkpoint 0 is the untrained
@@ -314,6 +346,9 @@ def train(
                 )
             )
             checkpoint_index += 1
+            if checkpoint_callback is not None and not checkpoint_callback(checkpoints[-1]):
+                stopped_early = True
+                break
 
         epsilon = agent_config.epsilon.value_at(episode)
         # The visit-weighted schedule reads the table's own experience back out;
@@ -367,15 +402,20 @@ def train(
             )
         )
 
+        episodes_completed = episode + 1
+
         if progress and config.log_every > 0 and (episode + 1) % config.log_every == 0:
             _print_progress(records[-config.log_every :], episode, epsilon, config, out)
 
-    if schedule:
+    # A stopped run broke out *immediately after* a checkpoint, so its curve already
+    # ends on the table as it stands; measuring again at the same episode index would
+    # append a duplicate point and charge the trial for an evaluation it did not need.
+    if schedule and not stopped_early:
         # The final table is what every reported evaluation number describes, so the
         # curve has to end on it rather than on the second-to-last checkpoint.
         checkpoints.append(
             _measure_checkpoint(
-                q_table, scenario, config, config.episodes, total_env_steps, checkpoint_index
+                q_table, scenario, config, episodes_completed, total_env_steps, checkpoint_index
             )
         )
 
@@ -389,9 +429,18 @@ def train(
         total_env_steps=total_env_steps,
         checkpoints=checkpoints,
         visit_counts=visit_counts,
+        episodes_completed=episodes_completed,
+        stopped_early=stopped_early,
         metadata={
             "scenario": scenario.name,
             "num_states": env.num_states,
+            "battery_encoding": str(config.battery_encoding),
+            "battery_levels": env.encoder.battery_levels,
+            "battery_bins": [
+                env.encoder.binning.label(level) for level in range(env.encoder.battery_levels)
+            ]
+            if not env.encoder.binning.is_dense
+            else None,
             "tied_state_fraction": tied_state_fraction(q_table),
             "learned_state_fraction": learned_state_fraction(q_table, config.initial_q),
             "visited_state_count": int(np.count_nonzero(visit_counts)),
@@ -399,9 +448,11 @@ def train(
                 **curriculum.describe(),
                 "pending_human_functions": list(curriculum_pending),
                 "distinct_start_states": len(start_states),
-                "episodes_from_curriculum": config.episodes - canonical_episodes,
+                "episodes_from_curriculum": episodes_completed - canonical_episodes,
             },
             "eval_checkpoints": len(checkpoints),
+            "episodes_completed": episodes_completed,
+            "stopped_early": stopped_early,
         },
     )
 
@@ -433,6 +484,7 @@ def _measure_checkpoint(
         gamma=config.gamma,
         potential_scale=config.potential_scale,
         max_steps=config.max_steps,
+        battery_encoding=config.battery_encoding,
         capture_best=False,
     )
     summary = result.summary

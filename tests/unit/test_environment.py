@@ -11,7 +11,7 @@ from mars_rover_q.actions import Action
 from mars_rover_q.environment import MarsRoverEnv, Outcome
 from mars_rover_q.rewards import RewardMode, make_reward_model
 from mars_rover_q.scenario import Scenario
-from mars_rover_q.state import RoverState, SampleType
+from mars_rover_q.state import BatteryEncoding, RoverState, SampleType
 from tests.conftest import make_scenario
 
 
@@ -330,7 +330,48 @@ def test_observation_matches_the_encoder_for_every_step(tiny_env: MarsRoverEnv) 
     for action in (Action.EAST, Action.EAST, Action.COLLECT, Action.SOUTH):
         observation, *_ = tiny_env.step(action)
         assert observation == tiny_env.encoder.encode(tiny_env.state)
-        assert tiny_env.encoder.decode(observation) == tiny_env.state
+        # The row round-trips; the exact charge does not, because several readings
+        # share a row under the default binning. Position and payload always do.
+        decoded = tiny_env.encoder.decode(observation)
+        assert (decoded.row, decoded.col, decoded.carried) == (
+            tiny_env.state.row,
+            tiny_env.state.col,
+            tiny_env.state.carried,
+        )
+        assert tiny_env.encoder.encode(decoded) == observation
+
+
+def test_the_dense_encoding_round_trips_the_exact_battery(tiny_scenario: Scenario) -> None:
+    """``--dense-battery`` is the original encoding, where a row *is* a state."""
+    model = make_reward_model(RewardMode.SPARSE, tiny_scenario, 0.99)
+    env = MarsRoverEnv(
+        tiny_scenario,
+        model,
+        rng=np.random.default_rng(0),
+        battery_encoding=BatteryEncoding.DENSE,
+    )
+    env.reset()
+    assert env.num_states == 5 * 5 * (tiny_scenario.battery_capacity + 1) * 4
+    for action in (Action.EAST, Action.EAST, Action.COLLECT, Action.SOUTH):
+        observation, *_ = env.step(action)
+        assert env.encoder.decode(observation) == env.state
+
+
+def test_the_battery_encoding_changes_the_table_and_not_the_dynamics(
+    tiny_scenario: Scenario,
+) -> None:
+    """Two encodings, one MDP: identical seeds must give identical trajectories."""
+    actions = (Action.EAST, Action.EAST, Action.COLLECT, Action.SOUTH, Action.WEST)
+    trajectories = []
+    for encoding in BatteryEncoding:
+        model = make_reward_model(RewardMode.SPARSE, tiny_scenario, 0.99)
+        env = MarsRoverEnv(
+            tiny_scenario, model, rng=np.random.default_rng(7), battery_encoding=encoding
+        )
+        env.reset(seed=7)
+        trajectories.append([(env.step(action)[1], env.state) for action in actions])
+
+    assert trajectories[0] == trajectories[1]
 
 
 def test_action_mask_marks_every_action_legal(tiny_env: MarsRoverEnv) -> None:

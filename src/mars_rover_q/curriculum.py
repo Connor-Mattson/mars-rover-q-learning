@@ -38,7 +38,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from .scenario import UNREACHABLE, Scenario
-from .state import COLLECTABLE_SAMPLES, RoverState, SampleType, StateEncoder
+from .state import (
+    COLLECTABLE_SAMPLES,
+    BatteryEncoding,
+    RoverState,
+    SampleType,
+    StateEncoder,
+)
 
 
 class CurriculumStrategy(StrEnum):
@@ -62,17 +68,25 @@ class CurriculumStrategy(StrEnum):
         The ``GROWING`` admission rule -- deliberately identical, so the comparison
         isolates one variable -- with the uniform draw replaced by one that
         downweights states whose Q-values have already been updated many times.
+    ``EXPLORING``
+        Uniform over the *whole* pool for the entire anneal: no ranking, no
+        widening, no schedule. Strictly it is not a curriculum but the exploring-
+        starts condition, and it is here because the three schedules above are not
+        merely slower than it -- on ``safe_corridor`` all three converge to a
+        policy worth 56% of the optimum while this one reaches 99%.
     """
 
     GROWING = "growing"
     SLIDING = "sliding"
     VISIT_WEIGHTED = "visit_weighted"
+    EXPLORING = "exploring"
 
 
 CURRICULUM_STRATEGY_LABELS: Final[dict[CurriculumStrategy, str]] = {
     CurriculumStrategy.GROWING: "Growing Window",
     CurriculumStrategy.SLIDING: "Sliding Window",
     CurriculumStrategy.VISIT_WEIGHTED: "Visit-Weighted",
+    CurriculumStrategy.EXPLORING: "Exploring Starts",
 }
 
 #: ``curriculum_fraction`` at or below which no curriculum runs at all. The control
@@ -444,6 +458,53 @@ def sample_visit_weighted_start_state(
     return ranked_pool[sampled_i]
 
 
+def sample_exploring_start_state(
+    ranked_pool: Sequence[RoverState],
+    canonical: RoverState,
+    progress: float,
+    rng: np.random.Generator,
+) -> RoverState:
+    """Draw uniformly from the whole pool, ignoring rank and ignoring the anneal.
+
+    The deliberate absence of a schedule is the point, so this is the one sampler
+    that does not consult ``progress`` except to honour the terminal guard. The
+    other three all move support from the easy end of the pool toward the canonical
+    start, which means the hard outbound states are visited early and then
+    abandoned -- exactly when their values would need to consolidate. Holding
+    coverage uniform and constant is what separates this arm from those.
+
+    Args:
+        ranked_pool: admissible start states. The ordering is irrelevant here, and
+            the pool is treated as read-only.
+        canonical: the real mission start, returned once the anneal is over.
+        progress: how far through the anneal this episode is, in ``[0, 1]``.
+        rng: the injected generator. Every draw must come from it, never from
+            ``numpy.random`` module-level functions.
+
+    Returns:
+        The state the episode should begin from: either ``canonical`` or a member
+        of ``ranked_pool``.
+
+    Raises:
+        ValueError: if ``progress`` falls outside ``[0, 1]``.
+
+    Invariants:
+        * ``progress >= 1.0`` returns ``canonical``, as every strategy must:
+          training still has to end on the distribution it is evaluated on.
+        * An empty ``ranked_pool`` returns ``canonical`` rather than raising.
+        * Below that, every pooled state is equally likely at every progress. The
+          support neither widens nor shrinks, because there is no schedule.
+        * ``ranked_pool`` is never reordered or mutated.
+    """
+    if progress < 0.0 or progress > 1.0:
+        raise ValueError(f"progress must lie in [0, 1], got {progress}")
+
+    if progress >= 1.0 or not ranked_pool:
+        return canonical
+
+    return ranked_pool[int(rng.integers(len(ranked_pool)))]
+
+
 def curriculum_stub_status() -> tuple[str, ...]:
     """Probe the human-owned sampler and report whether it still looks unfinished.
 
@@ -497,11 +558,17 @@ class StartStateCurriculum:
     ``strategy`` selects which of the three schedules in :class:`CurriculumStrategy`
     draws the start; ``window_fraction`` and ``weight_exponent`` are the knobs of
     the sliding and visit-weighted ones respectively and are ignored by the others.
+
+    ``battery_encoding`` is the table's, not the pool's: the pool always holds exact
+    battery readings, because that is what the environment is reset to. It is needed
+    only to turn a pool entry into the table row it will update, which under a coarse
+    binning several pool entries share -- see :attr:`pool_state_indices`.
     """
 
     __slots__ = (
         "anneal_episodes",
         "anneal_fraction",
+        "battery_encoding",
         "canonical",
         "pool_state_indices",
         "ranked_pool",
@@ -520,6 +587,7 @@ class StartStateCurriculum:
         strategy: CurriculumStrategy | str = CurriculumStrategy.GROWING,
         window_fraction: float = DEFAULT_WINDOW_FRACTION,
         weight_exponent: float = DEFAULT_WEIGHT_EXPONENT,
+        battery_encoding: BatteryEncoding | str = BatteryEncoding.AFFORDABILITY,
     ) -> None:
         if total_episodes <= 0:
             raise ValueError(f"total_episodes must be positive, got {total_episodes}")
@@ -536,24 +604,40 @@ class StartStateCurriculum:
         self.strategy = CurriculumStrategy(strategy)
         self.window_fraction = float(window_fraction)
         self.weight_exponent = float(weight_exponent)
+        self.battery_encoding = BatteryEncoding(battery_encoding)
         self.ranked_pool: tuple[RoverState, ...] = ()
         self.pool_state_indices: NDArray[np.int64] = np.zeros(0, dtype=np.int64)
         if self.enabled:
-            encoder = StateEncoder(scenario.rows, scenario.cols, scenario.battery_capacity)
+            encoder = StateEncoder(
+                scenario.rows,
+                scenario.cols,
+                scenario.battery_capacity,
+                scenario.battery_binning(self.battery_encoding),
+            )
             self.ranked_pool = tuple(
                 sorted(
                     enumerate_start_states(scenario),
-                    # Ties are broken by state index so the ordering -- and therefore
-                    # every sampled episode -- is reproducible from the seed alone.
+                    # Ties are broken by the state itself, not merely by its row ID:
+                    # under a coarse battery encoding a row is shared by every
+                    # reading in its bin, so the row alone no longer orders the pool
+                    # totally, and an unstable order would break reproducibility from
+                    # the seed alone.
                     key=lambda state: (
                         start_state_difficulty(scenario, state),
                         encoder.encode(state),
+                        state.row,
+                        state.col,
+                        state.battery,
+                        int(state.carried),
                     ),
                 )
             )
             # Encoded once here rather than per episode: the visit-weighted strategy
             # needs to read a per-state quantity in pool order on every draw, and the
-            # encoding never changes for a fixed map.
+            # encoding never changes for a fixed map. Under a coarse binning these
+            # indices repeat, which is the honest reading of the tilt: it chases
+            # under-updated *table rows*, and a binned row is exactly what several
+            # pool entries share.
             self.pool_state_indices = np.array(
                 [encoder.encode(state) for state in self.ranked_pool], dtype=np.int64
             )
@@ -632,6 +716,8 @@ class StartStateCurriculum:
                 self.pool_update_counts(visit_counts),
                 exponent=self.weight_exponent,
             )
+        if self.strategy is CurriculumStrategy.EXPLORING:
+            return sample_exploring_start_state(self.ranked_pool, self.canonical, progress, rng)
         return sample_start_state(self.ranked_pool, self.canonical, progress, rng)
 
     def difficulty_quantiles(
@@ -737,6 +823,7 @@ def simulate_start_distribution(
         curriculum.scenario.rows,
         curriculum.scenario.cols,
         curriculum.scenario.battery_capacity,
+        curriculum.scenario.battery_binning(curriculum.battery_encoding),
     )
     counts = np.zeros(encoder.num_states, dtype=np.int64)
 
@@ -800,6 +887,7 @@ __all__ = [
     "enumerate_start_states",
     "growing_window_bounds",
     "rank_band_shares",
+    "sample_exploring_start_state",
     "sample_sliding_window_start_state",
     "sample_start_state",
     "sample_visit_weighted_start_state",

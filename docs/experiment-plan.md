@@ -396,3 +396,150 @@ Study 2's rules carry over, plus:
   `curriculum.pending_human_functions`. That run started every episode at the lander;
   it is the control wearing a treatment label, and `train` prints a banner saying so.
 
+
+---
+
+# Study 4 — which hyper-parameters learn fastest
+
+> Status: **pre-registration**. Written before any search was run. Every number below is
+> a budget, a bound, or a capacity; none is a result.
+
+**Connor's question, and his framing of it.** Studies 1 to 3 hold the hyper-parameters
+fixed at values that were never tuned — learning rate `0.2`, `gamma 0.99`, epsilon
+`1.0 → 0.05` over 60% of the budget — because each was asking about something else, and a
+factor you are not studying has to be held constant. He asked the question those studies
+cannot: *which set of hyper-parameters reaches the best reward in the fewest episodes?*
+Both halves of the framing are his, including the two constraints that make it answerable
+(see the Discovery log entry for 2026-09-10).
+
+## Question
+
+On one map, with the reward mode held fixed, which hyper-parameters reach a high mission
+return in the fewest training episodes — and what does the search pay, in total
+episodes, to find out?
+
+## Design
+
+Run by `python -m mars_rover_q.cli tune --config configs/tuning/safe_corridor_search.json`.
+
+| Element | Value |
+|---|---|
+| Scenario | `safe_corridor` only |
+| Reward mode | `sparse`, held fixed |
+| Seeds per trial | `1, 2`, averaged into one curve |
+| Per-trial episode cap | 6000 per seed, so 12000 per trial |
+| Total study budget | 2,000,000 episodes |
+| Sampler | Optuna TPE, `sampler_seed = 0`, 10 startup trials |
+| Pruner | `MedianPruner`, 5 startup trials, 3 warm-up checkpoints |
+| Checkpoints | 12 per trial, 30 greedy episodes each |
+
+166 trials if nothing is ever pruned; more in practice, because a pruned trial returns
+its unspent episodes to the ledger. The search space:
+
+| Parameter | Range | Scale |
+|---|---|---|
+| `learning_rate` | 0.01 – 1.0 | log |
+| `gamma` | 0.9 – 0.9995 | linear |
+| `initial_q` | 0.0 – 200.0 | linear |
+| `epsilon_start` | 0.2 – 1.0 | linear |
+| `epsilon_end_ratio` | 0.001 – 0.5 of `epsilon_start` | log |
+| `epsilon_decay_fraction` | 0.05 – 0.95 | linear |
+| `use_curriculum` | `False`, `True` | categorical |
+| `curriculum_fraction` | 0.1 – 0.9 | linear, only when enabled |
+| `curriculum_strategy` | `growing`, `sliding`, `visit_weighted` | categorical, only when enabled |
+| `curriculum_window_fraction` | 0.02 – 0.5 | log, only under `sliding` |
+| `curriculum_weight_exponent` | 0.0 – 2.0 | linear, only under `visit_weighted` |
+
+**Three design constraints, and what each one is for.**
+
+1. **The per-trial cap is deliberately below convergence.** A well-tuned agent reaches
+   success 1.0 on `safe_corridor` in roughly 4000 episodes at the repository's fixed
+   defaults; the cap is 6000, which is enough for a good setting to converge and not
+   enough for a poor one to catch up. Some settings cannot reach the map's best return
+   inside it, which is the point: without a cap every eventually-converging setting
+   scores alike and the search silently becomes a search for final performance.
+2. **The total budget is bounded in advance.** 2M episodes, charged against one ledger,
+   spent or not spent; the study ends when what remains cannot fund another full trial.
+   The cost of a search is therefore known before it starts, and two searches are
+   comparable in total compute rather than in wall clock.
+3. **Two objectives, scalarised in exactly one place.** "Best reward in the fewest
+   episodes" is a trade-off. `score_learning_curve` is the single function that resolves
+   it, and `pareto_front` reports the trade-off it resolved, so the scalar's verdict and
+   the shape of the frontier are separate artefacts a reader can disagree with
+   separately.
+
+## Measurements
+
+Per trial, written to `study.json` and `trials.csv`:
+
+| Quantity | Reads as |
+|---|---|
+| `score` | The objective. Comparable across trials because every trial shares the episode cap and the return reference. `null` for a pruned trial — a truncated curve is not the same measurement. |
+| `best_return` | Best `mean_base_return` anywhere on the trial's curve: mission return with shaping excluded. |
+| `episodes_to_best` | The *earliest* checkpoint attaining that best. With `best_return`, the two Pareto axes. |
+| `final_return`, `final_success_rate` | Where the curve ended, for separating "learned fast" from "learned and held". |
+| `episodes_run` vs `episodes_granted` | What pruning saved. |
+| `curve` | The whole checkpoint curve, so any other objective can be computed after the fact from the same data. |
+
+The reference return is `best_affordable_return` — the most valuable sample whose lander
+round trip fits the battery, 160 on all three bundled maps. It is a **planning bound from
+shortest paths, not a target**: slip lowers the achievable mean, and a discount below 1.0
+can make a nearer sample optimal, so a score of 1.0 is unreachable by construction.
+
+## Pre-registered expectations
+
+1. **No prediction is recorded about which hyper-parameters win.** This is the point of
+   running a search rather than arguing from intuition, and a guess written here would
+   be a thing to rationalise against afterwards.
+2. The search is expected to *find something*: that the best trial's score is meaningfully
+   above the median trial's. If it is not, the likely causes are the cap being too
+   generous (everything converges) or too tight (nothing does), and the fix is the cap,
+   not the objective.
+3. Pruning is expected to fund more trials than `fundable_trials`. That is arithmetic
+   about the ledger, not a claim about learning.
+4. Whether the winning setting uses a curriculum at all is open, and a search that
+   selects `use_curriculum = False` is a legitimate result — it would say the curriculum
+   does not pay for itself *at this cap, on this map*, which is a narrower claim than
+   Study 3's and must not be reported as contradicting it.
+
+## Threats to validity
+
+- **One map, one reward mode.** A winner here is tuned to `safe_corridor` under `sparse`
+  and nothing else. Non-negotiable #3 applies with full force: these hyper-parameters
+  are not claimed to transfer to `risk_value_tradeoff`, and the honest follow-up is to
+  re-run the search per map, not to reuse the winner.
+- **The cap is part of the objective.** "Fastest learner" is defined relative to 6000
+  episodes. A different cap can reorder the trials, and a reported winner must name the
+  cap it won under.
+- **Two seeds is a thin average.** It is what the budget buys at this cap. A difference
+  between two adjacent trials' scores is well inside seed noise; only the shape of the
+  search — where the good region is — should be read from a single study.
+- **The best trial is selected on the same data that measured it.** That is what a
+  search does, and it makes the winning score optimistically biased. The confirmation
+  run exists to re-measure the winner on a full `eval_episodes` evaluation, and that
+  number, not the trial's score, is the one to quote.
+- **The score hides its trade-off by construction.** Hence the Pareto front, which is
+  reported alongside it and not instead of it.
+- **Optuna is in the learning path only as a proposer.** It never sees the environment,
+  the agent, or a reward; it suggests numbers and reads one score back. Non-negotiable
+  #1 is intact — there is still no RL framework here.
+
+## Cost
+
+Not yet measured. The bound is exact by construction: 2M training episodes plus one
+confirmation run, whatever the wall clock turns out to be. Pilot timing on a 30k-episode
+study measured 42 trials funded against 25 nominal, with pruning returning roughly 60% of
+each cut trial's budget; re-measure and record the real figure when the full study runs.
+
+## Reporting rules
+
+- Quote the confirmation run's `eval_mean_base_return`, not the winning trial's score,
+  as the performance of the tuned setting.
+- Name the cap and the map with every claim about learning speed.
+- Report the Pareto front whenever a single winner is named, so that a reader can see
+  what the scalar traded away.
+- Never quote a number from a study whose `search_is_meaningful` is `false`. That study
+  scored every trial identically, so its "best trial" is whichever one was asked first,
+  and `tune` prints a banner saying so.
+- A study's `budget.spent` belongs in the write-up next to its result. The point of the
+  ledger is that the cost of the answer is part of the answer.

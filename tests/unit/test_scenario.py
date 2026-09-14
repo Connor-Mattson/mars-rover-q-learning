@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from mars_rover_q.scenario import (
     resolve_scenario,
     scenario_from_dict,
 )
-from mars_rover_q.state import COLLECTABLE_SAMPLES, SampleType
+from mars_rover_q.state import COLLECTABLE_SAMPLES, BatteryEncoding, SampleType
 from tests.conftest import TINY_SCENARIO, make_scenario
 
 
@@ -203,3 +204,41 @@ def test_wall_tiles_are_not_traversable() -> None:
 def test_resolve_scenario_reports_unknown_names() -> None:
     with pytest.raises(FileNotFoundError, match="unknown scenario"):
         resolve_scenario("not_a_scenario")
+
+
+# -- battery axis ---------------------------------------------------------
+
+
+def test_mission_costs_are_the_round_trip_plus_the_collect_charge() -> None:
+    scenario = resolve_scenario("safe_corridor")
+    costs = scenario.mission_costs()
+
+    assert set(costs) == set(COLLECTABLE_SAMPLES)
+    for sample, cost in costs.items():
+        assert cost == scenario.round_trip_cost(sample) + scenario.collect_energy_cost
+
+
+def test_the_default_battery_axis_bins_at_the_mission_costs(bundled_scenario: Scenario) -> None:
+    """A bin edge sits at every charge where a sample stops being affordable."""
+    binning = bundled_scenario.battery_binning()
+    costs = sorted({math.ceil(c) for c in bundled_scenario.mission_costs().values()})
+
+    assert binning.edges == tuple(costs)
+    assert binning.levels == len(costs) + 1
+
+
+def test_every_bundled_scenario_gets_four_battery_bins(bundled_scenario: Scenario) -> None:
+    """Three samples, three distinct round trips, four bins -- on all three maps."""
+    assert bundled_scenario.battery_binning().levels == 4
+
+
+def test_the_dense_battery_axis_is_one_level_per_reading(bundled_scenario: Scenario) -> None:
+    binning = bundled_scenario.battery_binning(BatteryEncoding.DENSE)
+
+    assert binning.levels == bundled_scenario.battery_capacity + 1
+    assert binning.is_dense
+
+
+def test_the_default_axis_is_far_shorter_than_the_dense_one(bundled_scenario: Scenario) -> None:
+    dense = bundled_scenario.battery_binning(BatteryEncoding.DENSE).levels
+    assert bundled_scenario.battery_binning().levels * 10 < dense
