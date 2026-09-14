@@ -2,6 +2,31 @@
 
 ![The tuned safe_corridor policy delivering the biosignature](docs/assets/safe-corridor-tuned-policy.gif)
 
+## The mission
+
+A rover lands on Mars with a finite battery and three reachable samples worth 40, 90 and
+160 points. It can carry one. It has to bring it home. The mission is not *find the goal*
+— it is *choose which goal is affordable* — and under a sparse reward that is a hard
+exploration problem: the only non-zero signal arrives after a long, specific, risky
+sequence of actions that a random walk essentially never completes.
+
+This repository solves it with **tabular Q-learning and a start-state curriculum**, on a
+hand-written MDP with no RL framework anywhere in the learning path. The curriculum is what
+makes a table that size learnable: instead of starting every episode at the lander, training anneals
+over start states the rover could *physically have driven itself into*, widening from easy
+to hard while evaluation stays pinned to the canonical lander start.
+
+**The headline result.** On `safe_corridor`, a 20-trial hyper-parameter search at a
+400,000-episode cap produced 19 scored trials. Eighteen of them converge on the 90-point
+sample and stop there. **One reaches the 160-point optimum and holds it — the
+sliding-window start-state curriculum.** Its confirmation run scores a mean base return of
+**160.000** at a **1.000** success rate over 500 greedy episodes, and retrained on three
+seeds the search never saw it returns 159.998 / 159.993 / 159.998. The GIF above is that
+policy: the median episode of a fresh 500-episode greedy batch, 35 steps, home with 22 of
+60 battery left.
+
+---
+
 ## TL;DR
 
 Tabular Q-learning on a hand-written Mars sample-return MDP — up to 104,256 states × 5
@@ -44,31 +69,6 @@ episodes, delivering the 160-point biosignature in 500 of 500 — the optimum fo
 seconds. Drop `--dense-battery` to train on the four-bin affordability axis
 instead (1,600 rows rather than 24,400), and set `--curriculum-fraction 0` to see what the
 same agent does with no curriculum at all.
-
----
-
-## The mission
-
-A rover lands on Mars with a finite battery and three reachable samples worth 40, 90 and
-160 points. It can carry one. It has to bring it home. The mission is not *find the goal*
-— it is *choose which goal is affordable* — and under a sparse reward that is a hard
-exploration problem: the only non-zero signal arrives after a long, specific, risky
-sequence of actions that a random walk essentially never completes.
-
-This repository solves it with **tabular Q-learning and a start-state curriculum**, on a
-hand-written MDP with no RL framework anywhere in the learning path. The curriculum is what
-makes a table that size learnable: instead of starting every episode at the lander, training anneals
-over start states the rover could *physically have driven itself into*, widening from easy
-to hard while evaluation stays pinned to the canonical lander start.
-
-**The headline result.** On `safe_corridor`, a 20-trial hyper-parameter search at a
-400,000-episode cap produced 19 scored trials. Eighteen of them converge on the 90-point
-sample and stop there. **One reaches the 160-point optimum and holds it — the
-sliding-window start-state curriculum.** Its confirmation run scores a mean base return of
-**160.000** at a **1.000** success rate over 500 greedy episodes, and retrained on three
-seeds the search never saw it returns 159.998 / 159.993 / 159.998. The GIF above is that
-policy: the median episode of a fresh 500-episode greedy batch, 35 steps, home with 22 of
-60 battery left.
 
 ---
 
