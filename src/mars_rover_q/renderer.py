@@ -8,6 +8,7 @@ so the repository needs no downloaded art and screenshots are reproducible.
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -158,6 +159,24 @@ class MissionRenderer:
             return None
         return self.frame()
 
+    def draw_state(self, state: RoverState, lines: Sequence[str] = ()) -> NDArray[np.uint8]:
+        """Render one frame from a recorded state, with no environment involved.
+
+        :meth:`draw` reads the live environment, so replaying a stored episode
+        through it means re-stepping the environment and re-rolling every wheel
+        slip -- the picture would drift away from the episode that was actually
+        recorded. This path draws the recorded state directly, so an exported
+        animation is the episode that happened rather than a fresh sample from the
+        same policy. ``lines`` is the caption, supplied by the caller because the
+        narration has to come from the recording too.
+        """
+        self.surface.fill(BACKGROUND)
+        self._draw_grid(state)
+        self._draw_caption(lines)
+        # No keyboard hints: an exported animation has nothing to press.
+        self._draw_legend(show_controls=False)
+        return self.frame()
+
     def frame(self) -> NDArray[np.uint8]:
         """The current surface as an ``(H, W, 3)`` uint8 RGB array."""
         raw = self.pygame.surfarray.array3d(self.surface)
@@ -239,6 +258,20 @@ class MissionRenderer:
             self.pygame.draw.rect(self.surface, colour, bay)
             self.pygame.draw.rect(self.surface, (20, 20, 24), bay, 1)
             self._blit_centred(self.small_font, glyph, bay.center, (20, 20, 24))
+
+    def _draw_caption(self, lines: Sequence[str]) -> None:
+        """The side panel for :meth:`draw_state`: a title and caller-supplied text."""
+        panel = self.pygame.Rect(
+            MARGIN * 2 + self.grid_width, MARGIN, PANEL_WIDTH, self.height - LEGEND_HEIGHT - MARGIN
+        )
+        self.pygame.draw.rect(self.surface, PANEL_BG, panel, border_radius=6)
+        x = panel.x + 14
+        y = panel.y + 14
+        self.surface.blit(self.title_font.render("MISSION CONTROL", True, TEXT), (x, y))
+        y += 34
+        for line in lines:
+            self.surface.blit(self.font.render(line, True, TEXT if line else MUTED), (x, y))
+            y += 24
 
     def _draw_panel(self, env: MarsRoverEnv, extra_lines: tuple[str, ...]) -> None:
         panel = self.pygame.Rect(
@@ -325,7 +358,7 @@ class MissionRenderer:
         self.pygame.draw.rect(self.surface, GRID_LINE, outer, 1, border_radius=3)
         return y + 22
 
-    def _draw_legend(self) -> None:
+    def _draw_legend(self, *, show_controls: bool = True) -> None:
         top = self.height - LEGEND_HEIGHT
         panel = self.pygame.Rect(MARGIN, top, self.width - 2 * MARGIN, LEGEND_HEIGHT - MARGIN)
         self.pygame.draw.rect(self.surface, PANEL_BG, panel, border_radius=6)
@@ -359,7 +392,7 @@ class MissionRenderer:
         y += 24
 
         col_x = x
-        for line in CONTROLS_HELP:
+        for line in CONTROLS_HELP if show_controls else ():
             self.surface.blit(self.small_font.render(line, True, MUTED), (col_x, y))
             col_x += 240
             if col_x > panel.right - 200:

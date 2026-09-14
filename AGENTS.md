@@ -50,7 +50,13 @@ ruff format --check . && ruff check . && mypy && pytest
 
 All four must pass. `pytest` deselects `human_todo` by default; that suite is run
 separately with `pytest -m human_todo tests/human_todo` and is **expected to fail**
-until the assignment is done.
+while an assignment is open.
+
+For the inner loop, `pytest -m "not slow and not human_todo"` is ~12s against the full
+gate's ~56s; it drops only the two tests that render a matplotlib frame per battery
+level. Keep both clauses — a command-line `-m` replaces `addopts` instead of combining
+with it, so `-m "not slow"` alone silently re-enables the teaching suite. Run the
+unfiltered `pytest` before calling anything done.
 
 ## The "check my work" workflow
 

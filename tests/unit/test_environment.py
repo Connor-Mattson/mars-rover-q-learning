@@ -348,3 +348,45 @@ def test_invalid_render_mode_is_rejected(tiny_scenario: Scenario) -> None:
     model = make_reward_model(RewardMode.SPARSE, tiny_scenario, 0.99)
     with pytest.raises(ValueError, match="render_mode"):
         MarsRoverEnv(tiny_scenario, model, render_mode="ansi")
+
+
+def test_reset_defaults_to_the_canonical_lander_start(tiny_env: MarsRoverEnv) -> None:
+    tiny_env.reset()
+    assert tiny_env.state == RoverState(1, 1, 20, SampleType.NONE)
+
+
+def test_reset_accepts_an_explicit_start_state(tiny_env: MarsRoverEnv) -> None:
+    """The seam the training curriculum uses; evaluation never touches it."""
+    start = RoverState(3, 3, 12, SampleType.BASALT)
+    observation, info = tiny_env.reset(start_state=start)
+    assert tiny_env.state == start
+    assert observation == tiny_env.encoder.encode(start)
+    assert info["battery"] == 12
+    assert info["payload"] == "BASALT"
+    assert info["position"] == (3, 3)
+
+
+def test_an_explicit_start_state_still_ends_the_episode_normally(
+    tiny_env: MarsRoverEnv,
+) -> None:
+    """Starting one tile out with a sample delivers on the very next step."""
+    tiny_env.reset(start_state=RoverState(1, 2, 5, SampleType.BIOSIGNATURE))
+    _obs, reward, terminated, truncated, info = tiny_env.step(Action.WEST)
+    assert terminated and not truncated
+    assert info["outcome"] == "success"
+    assert reward == 160.0
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        RoverState(2, 2, 10, SampleType.NONE),  # wall
+        RoverState(9, 9, 10, SampleType.NONE),  # off the map
+        RoverState(1, 2, 0, SampleType.BASALT),  # already battery-depleted
+        RoverState(1, 1, 10, SampleType.BASALT),  # already a completed delivery
+        RoverState(1, 2, 999, SampleType.NONE),  # battery above capacity
+    ],
+)
+def test_reset_rejects_an_impossible_start_state(tiny_env: MarsRoverEnv, start: RoverState) -> None:
+    with pytest.raises(ValueError):
+        tiny_env.reset(start_state=start)

@@ -173,16 +173,29 @@ class MarsRoverEnv:
 
     # -- episode lifecycle ------------------------------------------------
 
-    def reset(self, *, seed: int | None = None) -> tuple[int, dict[str, Any]]:
-        """Start a new episode at the lander with a full battery."""
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        start_state: RoverState | None = None,
+    ) -> tuple[int, dict[str, Any]]:
+        """Start a new episode, by default at the lander with a full battery.
+
+        Args:
+            seed: when given, replaces the environment generator.
+            start_state: an explicit, non-terminal state to begin from. This is the
+                seam the training start-state curriculum uses; evaluation and the
+                real mission always leave it ``None``. The state is validated, not
+                trusted -- an unreachable start would train values for a mission
+                that cannot happen.
+
+        Raises:
+            ValueError: if ``start_state`` is off the map, on a wall, flat, or
+                already a completed delivery.
+        """
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        self._state = RoverState(
-            row=self.scenario.lander[0],
-            col=self.scenario.lander[1],
-            battery=self.scenario.battery_capacity,
-            carried=SampleType.NONE,
-        )
+        self._state = self._validated_start(start_state)
         self._stats = EpisodeStats()
         self._outcome = Outcome.ONGOING
         self.reward_model.reset(self._state)
@@ -206,6 +219,27 @@ class MarsRoverEnv:
             "episode": self._stats_snapshot(),
         }
         return self.observation, dict(self._last_info)
+
+    def _validated_start(self, start_state: RoverState | None) -> RoverState:
+        """Check an explicit start state, or build the canonical lander start."""
+        if start_state is None:
+            return RoverState(
+                row=self.scenario.lander[0],
+                col=self.scenario.lander[1],
+                battery=self.scenario.battery_capacity,
+                carried=SampleType.NONE,
+            )
+        self.encoder.encode(start_state)  # raises for out-of-range rows, cols, battery
+        if not self.scenario.is_traversable(start_state.position):
+            raise ValueError(f"start state {start_state} is not on a traversable tile")
+        if start_state.battery <= 0:
+            raise ValueError(f"start state {start_state} is already battery-depleted")
+        if (
+            start_state.carried is not SampleType.NONE
+            and start_state.position == self.scenario.lander
+        ):
+            raise ValueError(f"start state {start_state} is already a completed delivery")
+        return start_state
 
     def step(self, action: int | Action) -> tuple[int, float, bool, bool, dict[str, Any]]:
         """Apply one action and advance the mission by a single step."""

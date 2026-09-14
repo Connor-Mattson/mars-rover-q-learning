@@ -1,113 +1,43 @@
-# Current assignment: the tabular Q-learning core
+# Current Assignment
 
-Everything around the algorithm is built and green. What is missing is the algorithm.
+**None.** `sample_visit_weighted_start_state` passed review on 2026-09-10; the record is
+in `.teacher/history.md`.
 
-**File:** `src/mars_rover_q/agent.py`
-**Marker:** every unfinished body carries `TODO(human):`
-**Scope:** the five functions below, and nothing else. Do not change their signatures,
-do not move them to another module, and do not touch the trainer — `training.py` and
-`evaluation.py` already call exactly these functions, so implementing them is the whole
-job.
+## Where the repository stands
 
-Before you start, if you have not already: play the environment for a few minutes.
+All six human-owned functions are implemented and every teaching test is green:
+
+| Assignment | Functions | Date |
+|---|---|---|
+| Tabular Q-learning core | `select_action`, `q_update`, `epsilon_at`, `learning_rate_at`, `evaluate_greedy_action` (`agent.py`) | 2026-09-08 |
+| Annealed start-state curriculum | `enumerate_start_states`, `sample_start_state` (`curriculum.py`) | 2026-09-09 |
+| Budget-sweep analysis | `paired_difference` (`metrics.py`), `budget_to_reach` (`sweep.py`) | 2026-09-09 |
+| Visit-weighted curriculum | `sample_visit_weighted_start_state` (`curriculum.py`) | 2026-09-10 |
+
+`pytest` is 370 passed; `pytest -m human_todo tests/human_todo` is 115 passed.
+`agent.teaching_stub_status()` and `curriculum.curriculum_stub_status()` both return
+empty, so `train` prints no teaching banner.
+
+## What is unblocked by this
+
+**Study 3 — which curriculum schedule** is pre-registered in `docs/experiment-plan.md`
+and was waiting on this function: a `visit_weighted` cell trained against the stub is
+the control arm wearing a treatment label. It can now be run for real.
 
 ```bash
-python -m mars_rover_q.cli play --scenario safe_corridor
+python -m mars_rover_q.cli experiment \
+    --config configs/experiments/curriculum_strategy_sweep.json \
+    --output artifacts/study3
 ```
 
-You will feel the slip, the energy drain, and the pull of the biosignature long before
-you feel it in a reward curve.
+600 cells, 4.68M episodes. Read the pre-registered expectations before looking at the
+output, and record what actually happened — including "no arm won", which is a
+legitimate result and one of the three registered possibilities.
 
----
+## Recurring feedback worth carrying forward
 
-## 1. `initialize_q_table(num_states, num_actions=5, *, initial_value=0.0, dtype=np.float64)`
-
-**Returns** a fresh `(num_states, num_actions)` array where **every entry equals
-`initial_value`**, using `dtype`.
-
-- `initial_value` is not decoration. Optimistic initialisation — starting every entry
-  above any achievable return — is a real exploration device, and the tests use nonzero
-  and negative values.
-- Reject `num_states <= 0` or `num_actions <= 0` with `ValueError`. The current
-  placeholder silently clamps them, which is worse than crashing.
-- Each call must return an independent array. Two tables must not share memory.
-
-**Edge cases:** zero dimensions, negative dimensions, `dtype=np.float32`, negative
-initial values.
-
-## 2. `calculate_target(reward, next_state_values, gamma, terminated, truncated)`
-
-**Returns** the scalar the current estimate should be moved toward.
-
-- Q-learning is **off-policy**: the bootstrap uses the *best* action available in the
-  successor state, not the action the behaviour policy will take next. The test with a
-  single good action buried at index 2 exists precisely to catch "take the first one".
-- **Neither** `terminated` **nor** `truncated` bootstraps. In both cases the target must
-  not depend on `next_state_values` at all. This is a stated convention of the project
-  (see the README); it makes truncated episodes slightly pessimistic and keeps your
-  implementation to one case distinction.
-- `gamma` scales the bootstrapped part only.
-
-**Edge cases:** terminated, truncated, both false, `gamma` at 0.1 and 0.99.
-
-## 3. `calculate_td_error(current_estimate, target)`
-
-**Returns** the signed discrepancy, oriented so that a **positive** result means the
-outcome was better than the table currently believes and the entry should move **up**.
-
-Sign is the entire content of this function. Get it backwards and the agent learns to
-avoid reward, confidently and quietly.
-
-**Edge cases:** target above the estimate (positive), equal (exactly zero), below
-(negative).
-
-## 4. `update_q_value(q_table, state_index, action_index, learning_rate, td_error)`
-
-**Mutates** `q_table` in place. Returns `None`.
-
-- Move the selected entry along the TD error, scaled by `learning_rate`. With
-  `learning_rate = 1.0` the entry must land exactly on the target.
-- **Exactly one entry changes.** Every other entry — including the other four actions of
-  the same state — must be bit-for-bit unchanged. A test diffs the whole flattened table
-  and asserts a single changed index.
-- Repeated calls accumulate; there is no reset.
-
-**Edge cases:** learning rate 1.0, two different learning rates on identical input,
-repeated calls on the same entry.
-
-## 5. `select_action(q_table, state_index, epsilon, rng, action_mask=None)`
-
-**Returns** an action index, chosen epsilon-greedily.
-
-- With `epsilon = 0`, purely greedy. With `epsilon = 1`, uniform over the legal actions.
-- **Every random draw comes from `rng`.** Never `np.random.something(...)` — the whole
-  reproducibility protocol rests on this. Two generators built from the same seed must
-  produce the same sequence of actions.
-- **Break greedy ties randomly.** A freshly initialised table is *all* ties, so
-  "return the first argmax" means the rover drives north into a wall until epsilon
-  decays. The test asserts that a table of equal values eventually produces all five
-  actions, and that a two-way tie produces exactly those two.
-- When `action_mask` is given, restrict **both** exploration and the greedy choice to
-  the `True` entries. Raise `ValueError` if nothing is legal.
-
-**Edge cases:** epsilon 0, epsilon 1, intermediate epsilon under a fixed seed, full tie,
-partial tie, a mask with one or two legal actions, an all-`False` mask.
-
----
-
-## Definition of done
-
-1. `pytest -m human_todo tests/human_todo` — all pass, with **no changes** to the test
-   file. Adjusting a test to fit an implementation is not a pass.
-2. `pytest` — still fully green.
-3. `ruff format --check . && ruff check . && mypy` — clean.
-4. `python -m mars_rover_q.cli train --scenario safe_corridor --reward sparse --seed 1
-   --episodes 4000` — no longer prints the `TEACHING STATE` banner, and the resulting
-   `manifest.json` records `"learning_is_meaningful": true`.
-5. Every random draw in your code comes from the injected `rng`.
-6. No implementation of these five algorithms exists anywhere else in the repository.
-
-Stuck? `.teacher/hints.md` escalates in stages — read one at a time. Test commands and
-what to expect before and after are in `.teacher/how-to-test.md`.
-
-**When finished, return to Claude and say: check my work**
+The incidental-raise pattern has now cost a revision round in three consecutive
+assignments: a guard that covers what its test exercises, with the documented
+`Raises:` clause left partly unimplemented and a library exception three frames down
+making the test green anyway. The habit that fixes it is to write each guard from the
+sentence in the docstring, then to construct an input that misses the exploding line.

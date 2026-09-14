@@ -1,0 +1,49 @@
+{
+  "name": "curriculum_budget_sweep",
+  "scenarios": [
+    "safe_corridor",
+    "risk_value_tradeoff",
+    "shaping_trap"
+  ],
+  "reward_modes": [
+    "sparse"
+  ],
+  "seeds": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10
+  ],
+  "episode_budgets": [
+    1000,
+    3000,
+    5000,
+    10000,
+    20000
+  ],
+  "curriculum_fractions": [
+    0.0,
+    0.5
+  ],
+  "eval_episodes": 300,
+  "save_q_tables": "max_budget",
+  "learning_rate": 0.2,
+  "gamma": 0.99,
+  "initial_q": 0.0,
+  "epsilon_start": 1.0,
+  "epsilon_end": 0.05,
+  "epsilon_decay_fraction": 0.6,
+  "success_threshold": 0.8,
+  "threshold_window": 100,
+  "log_every": 0,
+  "eval_checkpoints": 50,
+  "checkpoint_episodes": 40,
+  "write_gifs": true,
+  "gif_seed": 1
+}

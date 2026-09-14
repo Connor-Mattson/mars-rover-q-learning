@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from mars_rover_q.state import (
@@ -76,3 +77,34 @@ def test_payload_states_are_distinct_rows() -> None:
         for carried in (SampleType.NONE, *COLLECTABLE_SAMPLES)
     }
     assert len(indices) == NUM_PAYLOAD_STATES
+
+
+def test_grid_view_agrees_with_decode_on_every_index() -> None:
+    """The reshape is only a legitimate shortcut if it *is* the decode."""
+    encoder = StateEncoder(rows=3, cols=4, battery_capacity=5)
+    values = np.arange(encoder.num_states, dtype=np.int64)
+    view = encoder.grid_view(values)
+
+    assert view.shape == (3, 4, 6, NUM_PAYLOAD_STATES)
+    for index in range(encoder.num_states):
+        state = encoder.decode(index)
+        assert view[state.row, state.col, state.battery, int(state.carried)] == index
+
+
+def test_grid_view_sums_battery_away_per_cell_and_payload() -> None:
+    encoder = StateEncoder(rows=2, cols=2, battery_capacity=3)
+    values = np.zeros(encoder.num_states, dtype=np.int64)
+    values[encoder.encode(RoverState(1, 0, 2, SampleType.BIOSIGNATURE))] = 5
+    values[encoder.encode(RoverState(1, 0, 3, SampleType.BIOSIGNATURE))] = 7
+
+    per_cell = encoder.grid_view(values).sum(axis=2)
+    assert per_cell[1, 0, int(SampleType.BIOSIGNATURE)] == 12
+    assert per_cell.sum() == 12
+
+
+def test_grid_view_rejects_arrays_that_are_not_one_row_per_state() -> None:
+    encoder = StateEncoder(rows=2, cols=2, battery_capacity=3)
+    with pytest.raises(ValueError, match="1-D array"):
+        encoder.grid_view(np.zeros((encoder.num_states, 5), dtype=np.float64))
+    with pytest.raises(ValueError, match="1-D array"):
+        encoder.grid_view(np.zeros(encoder.num_states + 1, dtype=np.float64))

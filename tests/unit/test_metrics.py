@@ -8,14 +8,19 @@ import numpy as np
 import pytest
 
 from mars_rover_q.metrics import (
+    CSV_COLUMNS,
     EpisodeRecord,
+    canonical_start_records,
     env_steps_to_threshold,
     episodes_to_threshold,
     greedy_actions,
+    learned_state_fraction,
+    learned_state_mask,
     mean_ci,
     rolling_success_rate,
     summarize_episodes,
     t_critical_95,
+    tied_state_fraction,
 )
 
 
@@ -131,3 +136,78 @@ def test_rolling_window_must_be_positive() -> None:
 def test_greedy_actions_picks_the_highest_valued_column() -> None:
     table = np.array([[0.0, 1.0, 0.5], [2.0, -1.0, 0.0]])
     assert list(greedy_actions(table)) == [1, 0]
+
+
+def test_records_default_to_the_canonical_start() -> None:
+    """Evaluation and non-curriculum training never set the flag explicitly."""
+    assert record(0).from_canonical_start is True
+
+
+def test_canonical_start_records_filters_curriculum_episodes() -> None:
+    records = [
+        record(0, from_canonical_start=False),
+        record(1),
+        record(2, from_canonical_start=False),
+        record(3),
+    ]
+    assert [r.episode for r in canonical_start_records(records)] == [1, 3]
+
+
+def test_canonical_start_records_keeps_everything_without_a_curriculum() -> None:
+    records = [record(i) for i in range(4)]
+    assert canonical_start_records(records) == records
+
+
+def test_the_start_flag_is_a_csv_column() -> None:
+    """It has to survive the run directory, or plots cannot separate the two."""
+    assert "from_canonical_start" in CSV_COLUMNS
+
+
+def test_a_fresh_table_is_entirely_tied() -> None:
+    """Every action equal means select_action is choosing uniformly at random."""
+    assert tied_state_fraction(np.zeros((10, 5))) == 1.0
+    assert tied_state_fraction(np.full((10, 5), 7.5)) == 1.0
+
+
+def test_a_fully_decided_table_has_no_ties() -> None:
+    table = np.tile(np.array([0.0, 1.0, 2.0, 3.0, 4.0]), (10, 1))
+    assert tied_state_fraction(table) == 0.0
+
+
+def test_tied_fraction_counts_untouched_rows() -> None:
+    table = np.zeros((4, 5))
+    table[0, 2] = 1.0
+    table[3, 0] = -2.0
+    assert tied_state_fraction(table) == 0.5
+
+
+def test_tied_fraction_of_an_empty_table_is_zero() -> None:
+    assert tied_state_fraction(np.zeros((0, 5))) == 0.0
+
+
+def test_learned_state_mask_flags_only_rows_that_moved_off_the_initial_value() -> None:
+    table = np.zeros((4, 3))
+    table[1, 2] = -0.5
+    table[3, :] = 7.0
+
+    mask = learned_state_mask(table)
+    assert mask.tolist() == [False, True, False, True]
+    assert learned_state_fraction(table) == 0.5
+
+
+def test_learned_state_mask_honours_optimistic_initialisation() -> None:
+    """Compared against 0.0 an optimistically initialised table looks fully learned."""
+    table = np.full((3, 2), 5.0)
+    table[0, 0] = 4.0
+
+    assert learned_state_mask(table, initial_value=5.0).tolist() == [True, False, False]
+    assert learned_state_mask(table, initial_value=0.0).tolist() == [True, True, True]
+
+
+def test_learned_state_mask_is_not_the_complement_of_tied_states() -> None:
+    """A row can be learned and still tied: the two diagnostics measure different things."""
+    table = np.zeros((2, 3))
+    table[0, :] = 2.0  # every action moved, by the same amount
+
+    assert learned_state_mask(table).tolist() == [True, False]
+    assert tied_state_fraction(table) == 1.0

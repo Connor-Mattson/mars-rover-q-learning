@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any, Final
 
@@ -110,6 +110,12 @@ class EpisodeRecord:
 
     ``base_return`` excludes shaping; ``shaped_return`` is what the agent actually
     optimised. Reports must never substitute one for the other.
+
+    ``from_canonical_start`` is ``True`` for every evaluation episode and for any
+    training episode that began at the lander with a full battery. Training episodes
+    started elsewhere by the start-state curriculum are easier by construction, so a
+    success rate that mixes the two is not a learning curve -- see
+    :func:`canonical_start_records`.
     """
 
     episode: int
@@ -128,6 +134,7 @@ class EpisodeRecord:
     repeated_edge_fraction: float
     epsilon: float = 0.0
     env_steps_before: int = 0
+    from_canonical_start: bool = True
 
     def as_dict(self) -> dict[str, Any]:
         """A flat, CSV/JSON-friendly view."""
@@ -135,6 +142,43 @@ class EpisodeRecord:
 
 
 CSV_COLUMNS: Final[tuple[str, ...]] = tuple(EpisodeRecord.__dataclass_fields__)
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointRecord:
+    """Greedy performance on the canonical mission, measured mid-training.
+
+    Why this exists: a training episode's own outcome is not a comparable measure
+    of progress when the two conditions start their episodes in different places.
+    A curriculum run spends its anneal starting mid-mission, so filtering to
+    canonical-start training episodes leaves a thin, high-epsilon sample exactly
+    where the comparison matters most -- and positioning those few episodes by
+    their index within the filtered subsequence compresses them toward the origin,
+    which flatters the curriculum.
+
+    A checkpoint instead pauses training every ``cadence`` episodes and runs a
+    fixed batch of greedy episodes from the canonical lander start, with
+    exploration off. Both conditions are then measured on the same mission, at the
+    same training-episode counts, with the same evaluation budget. ``episode`` is
+    the true training-episode index, so these are directly plottable against
+    training effort.
+    """
+
+    episode: int
+    env_steps: int
+    episodes: int
+    success_rate: float
+    mean_base_return: float
+    mean_delivered_value: float
+    mean_steps: float
+
+    def as_dict(self) -> dict[str, Any]:
+        """A flat, CSV/JSON-friendly view."""
+        return asdict(self)
+
+
+#: Column order for ``eval_checkpoints.csv``.
+CHECKPOINT_CSV_COLUMNS: Final[tuple[str, ...]] = tuple(CheckpointRecord.__dataclass_fields__)
 
 
 @dataclass(slots=True)
@@ -185,6 +229,92 @@ def summarize_episodes(records: Iterable[EpisodeRecord]) -> EpisodeSummary:
     return summary
 
 
+def paired_difference(
+    treatment: Sequence[Mapping[str, Any]],
+    baseline: Sequence[Mapping[str, Any]],
+    metric: str,
+    *,
+    pair_on: str = "seed",
+) -> ConfidenceInterval:
+    """Mean ``treatment - baseline`` difference in ``metric``, paired by ``pair_on``.
+
+    Why paired: :func:`mars_rover_q.training.split_rngs` is deterministic, so the
+    curriculum and no-curriculum arms of a given seed share the same environment,
+    exploration, and start-state streams. The two arms are therefore *not*
+    independent samples, and comparing their separate confidence intervals throws
+    away the shared nuisance variance -- the part of a seed's outcome that is about
+    which map rolls it got rather than about the curriculum. Differencing within a
+    seed cancels it, and the interval that survives is usually far tighter than
+    either arm's own.
+
+    Args:
+        treatment: per-seed rows for the condition under test, as produced by
+            :func:`mars_rover_q.experiment.run_cell`. Read-only.
+        baseline: per-seed rows for the control condition. Read-only.
+        metric: the row key to difference, e.g. ``"eval_mean_base_return"``.
+        pair_on: the row key identifying a pair. Defaults to ``"seed"``.
+
+    Returns:
+        A :class:`ConfidenceInterval` over the per-pair differences, whose ``n`` is
+        the number of *pairs*, not the number of rows. An interval that excludes
+        zero is the claim; one that straddles it is not.
+
+    Raises:
+        ValueError: if either side contains two rows with the same ``pair_on``
+            value, which would make the pairing ambiguous.
+
+    Invariants:
+        * Only keys present on **both** sides contribute. A seed that ran in one
+          arm and not the other is dropped, never treated as a zero difference.
+        * A pair whose metric is ``None`` or non-finite on either side is dropped
+          for that metric alone, exactly as :func:`mean_ci`'s callers do. This is
+          how ``episodes_to_threshold`` -- which is legitimately ``None`` when the
+          threshold was never met -- stays out of the arithmetic instead of being
+          coerced to a number.
+        * Zero pairs returns the same all-``nan`` interval :func:`mean_ci` returns
+          for an empty sample; one pair returns the difference with a ``nan``
+          interval. Neither is an error.
+        * Neither argument is mutated or reordered.
+    """
+    # Check for key duplicates up front
+    treatment_keys = {t[pair_on] for t in treatment}
+    baseline_keys = {b[pair_on] for b in baseline}
+
+    if len(treatment_keys) != len(treatment):
+        raise ValueError("Treatment contains a duplicate key!")
+
+    if len(baseline_keys) != len(baseline):
+        raise ValueError("Treatment contains a duplicate key!")
+
+    key_intersection = treatment_keys.intersection(baseline_keys)
+
+    differences = []
+    for k in key_intersection:
+        usable_baseline, usable_treatment = False, False
+        # Find baseline value
+        for b in baseline:
+            if b[pair_on] == k:
+                base_val = b[metric]
+                usable_baseline = True
+                if base_val is None or not math.isfinite(float(base_val)):
+                    usable_baseline = False
+                    break
+
+        # Find treatment value
+        for t in treatment:
+            if t[pair_on] == k:
+                treat_val = t[metric]
+                usable_treatment = True
+                if treat_val is None or not math.isfinite(float(treat_val)):
+                    usable_treatment = False
+                    break
+
+        if usable_treatment and usable_baseline:
+            differences.append(treat_val - base_val)
+
+    return mean_ci(differences)
+
+
 def rolling_success_rate(records: Sequence[EpisodeRecord], window: int) -> NDArray[np.float64]:
     """Trailing success rate over a fixed window, aligned to each episode index."""
     if window <= 0:
@@ -230,6 +360,69 @@ def env_steps_to_threshold(
     return None
 
 
+def canonical_start_records(records: Sequence[EpisodeRecord]) -> list[EpisodeRecord]:
+    """The subset of ``records`` that began at the canonical lander start.
+
+    Curriculum runs deliberately start most early episodes somewhere easier, so
+    progress must be read from these episodes alone to stay comparable with a run
+    that had no curriculum. ``env_steps_before`` is untouched by the filter, so
+    sample-efficiency comparisons still count every step the agent actually took.
+    """
+    return [record for record in records if record.from_canonical_start]
+
+
+def tied_state_fraction(q_table: NDArray[np.float64]) -> float:
+    """Share of states whose action values are all identical.
+
+    A state is "tied" when nothing has ever broken the symmetry between its
+    actions -- typically because the state was never visited, so every entry still
+    holds the table's initial value. :func:`mars_rover_q.agent.select_action` then
+    picks uniformly at random among all of them, which is what makes the policy
+    overlay flicker between arrows on repeated draws.
+
+    This is the coverage diagnostic behind the start-state curriculum: a table that
+    solves its map from the lander but leaves most of the state space tied has
+    learned one corridor, not a policy.
+    """
+    if q_table.size == 0:
+        return 0.0
+    if q_table.shape[1] < 2:
+        return 1.0
+    return float(np.mean(np.ptp(q_table, axis=1) == 0.0))
+
+
+def learned_state_mask(
+    q_table: NDArray[np.float64], initial_value: float = 0.0
+) -> NDArray[np.bool_]:
+    """Which states hold at least one action value the trainer actually wrote.
+
+    A row that still equals the table's initial value everywhere was never on the
+    receiving end of an update: nothing was learned about that state, and its
+    greedy action is whatever ``argmax`` happens to return for a flat row. The
+    complement of this mask is therefore the honest denominator for "how much of
+    the state space did this run touch".
+
+    ``initial_value`` must be the run's ``initial_q``, not assumed zero --
+    optimistic initialisation is a supported exploration device, and comparing an
+    optimistically initialised table against ``0.0`` would report every state as
+    learned.
+
+    Related but not the same as :func:`tied_state_fraction`: a state that was
+    visited can still end up tied, and a state whose row moved uniformly away from
+    ``initial_value`` is learned but would not be counted here as tied.
+    """
+    if q_table.size == 0:
+        return np.zeros(q_table.shape[0], dtype=np.bool_)
+    return np.asarray(np.any(q_table != initial_value, axis=1), dtype=np.bool_)
+
+
+def learned_state_fraction(q_table: NDArray[np.float64], initial_value: float = 0.0) -> float:
+    """Share of states carrying a learned value; see :func:`learned_state_mask`."""
+    if q_table.size == 0:
+        return 0.0
+    return float(np.mean(learned_state_mask(q_table, initial_value)))
+
+
 def greedy_actions(q_table: NDArray[np.float64]) -> NDArray[np.int64]:
     """Highest-valued action per state, for policy export and the render overlay.
 
@@ -242,15 +435,22 @@ def greedy_actions(q_table: NDArray[np.float64]) -> NDArray[np.int64]:
 
 
 __all__ = [
+    "CHECKPOINT_CSV_COLUMNS",
     "CSV_COLUMNS",
+    "CheckpointRecord",
     "ConfidenceInterval",
     "EpisodeRecord",
     "EpisodeSummary",
+    "canonical_start_records",
     "env_steps_to_threshold",
     "episodes_to_threshold",
     "greedy_actions",
+    "learned_state_fraction",
+    "learned_state_mask",
     "mean_ci",
+    "paired_difference",
     "rolling_success_rate",
     "summarize_episodes",
     "t_critical_95",
+    "tied_state_fraction",
 ]
